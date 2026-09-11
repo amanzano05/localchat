@@ -22,6 +22,13 @@ data class ChatMessage(
     val timeMs: Long = 0L,
 )
 
+data class ConversationSummary(
+    val id: String,
+    val title: String,
+    val updatedAt: Long,
+    val messageCount: Int,
+)
+
 sealed interface ModelState {
     data object Missing : ModelState
     data class Downloading(val bytes: Long, val total: Long) : ModelState
@@ -36,6 +43,8 @@ data class ChatUiState(
     val generating: Boolean = false,
     val models: List<File> = emptyList(),
     val notice: String? = null,
+    val conversations: List<ConversationSummary> = emptyList(),
+    val currentId: String? = null,
 )
 
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
@@ -47,23 +56,125 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val _state = MutableStateFlow(ChatUiState())
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
 
+    private val conversations = mutableListOf<ChatStore.StoredConversation>()
+    private var currentId: String? = null
     private var nextId = 0L
 
     init {
-        // Restore the previous conversation before anything else, so the screen never flashes empty.
-        val restored = store.load()
-        nextId = (restored.maxOfOrNull { it.id } ?: -1L) + 1
-        _state.update { it.copy(messages = restored) }
-
+        val (stored, current) = store.load()
+        conversations.addAll(stored)
+        if (conversations.isEmpty()) {
+            startConversation()
+        } else {
+            open(conversations.firstOrNull { it.id == current } ?: conversations.maxByOrNull { it.updatedAt }!!)
+        }
         refreshModels()
         val default = repo.modelFile(ModelRepository.DEFAULT_MODEL_NAME)
         if (repo.isInstalled(default.name)) loadModel(default)
     }
 
-    private fun persist() {
-        val snapshot = _state.value.messages
-        viewModelScope.launch(Dispatchers.IO) { store.save(snapshot) }
+    // ---------------------------------------------------------------- conversations
+
+    private fun newId(): String = "c" + System.currentTimeMillis().toString(36) + "-" + (0..999).random()
+
+    private fun open(conv: ChatStore.StoredConversation) {
+        currentId = conv.id
+        nextId = (conv.messages.maxOfOrNull { it.id } ?: -1L) + 1
+        _state.update { it.copy(messages = conv.messages, currentId = conv.id, conversations = summaries()) }
     }
+
+    private fun startConversation() {
+        val now = System.currentTimeMillis()
+        val conv = ChatStore.StoredConversation(newId(), "New chat", now, now, emptyList())
+        conversations.add(0, conv)
+        open(conv)
+    }
+
+    private fun summaries(): List<ConversationSummary> =
+        conversations.sortedByDescending { it.updatedAt }
+            .map { ConversationSummary(it.id, it.title, it.updatedAt, it.messageCount()) }
+
+    private fun ChatStore.StoredConversation.messageCount(): Int = messages.count { !it.streaming }
+
+    /** Folds the live message list back into the stored conversation. */
+    private fun syncCurrent() {
+        val id = currentId ?: return
+        val idx = conversations.indexOfFirst { it.id == id }
+        val msgs = _state.value.messages
+        if (idx < 0) return
+        val prev = conversations[idx]
+        val title = if (prev.title == "New chat" || prev.title.isBlank()) titleFor(msgs) else prev.title
+        conversations[idx] = prev.copy(
+            title = title,
+            updatedAt = System.currentTimeMillis(),
+            messages = msgs,
+        )
+    }
+
+    private fun titleFor(messages: List<ChatMessage>): String {
+        val first = messages.firstOrNull { it.fromUser }?.text ?: return "New chat"
+        val clean = first.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.joinToString(" ")
+        return if (clean.length <= 42) clean else clean.take(42).trimEnd() + "…"
+    }
+
+    private fun historyOfCurrent(): List<Pair<Boolean, String>> =
+        _state.value.messages.filter { it.text.isNotBlank() }.map { it.fromUser to it.text }
+
+    private fun persist() {
+        syncCurrent()
+        val snapshot = conversations.toList()
+        val current = currentId
+        viewModelScope.launch(Dispatchers.IO) { store.save(snapshot, current) }
+    }
+
+    fun newChat() {
+        engine.cancel()
+        syncCurrent()
+        startConversation()
+        engine.resetConversation()
+        _state.update { it.copy(messages = emptyList(), notice = null) }
+        persist()
+    }
+
+    fun openConversation(id: String) {
+        if (id == currentId) return
+        val conv = conversations.firstOrNull { it.id == id } ?: return
+        engine.cancel()
+        syncCurrent()
+        open(conv)
+        // Give the model the thread's context back, otherwise it answers as a stranger.
+        if (_state.value.model is ModelState.Ready && conv.messages.any { !it.fromUser }) {
+            viewModelScope.launch(Dispatchers.IO) {
+                engine.switchConversation(conv.messages.filter { it.text.isNotBlank() }.map { it.fromUser to it.text })
+            }
+        }
+        persist()
+    }
+
+    fun deleteConversation(id: String) {
+        val idx = conversations.indexOfFirst { it.id == id }
+        if (idx < 0) return
+        conversations.removeAt(idx)
+        if (id == currentId) {
+            engine.cancel()
+            val next = conversations.maxByOrNull { it.updatedAt }
+            if (next == null) startConversation() else open(next)
+            engine.resetConversation()
+        }
+        _state.update { it.copy(conversations = summaries()) }
+        persist()
+    }
+
+    fun renameCurrent(title: String) {
+        val id = currentId ?: return
+        val idx = conversations.indexOfFirst { it.id == id }
+        if (idx < 0) return
+        conversations[idx] = conversations[idx].copy(title = title.trim().ifBlank { "New chat" })
+        _state.update { it.copy(conversations = summaries()) }
+        persist()
+    }
+
+    // ---------------------------------------------------------------- models
 
     private fun refreshModels() {
         _state.update { it.copy(models = repo.installedModels()) }
@@ -112,12 +223,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val backend = withContext(Dispatchers.IO) {
                     engine.load(file.absolutePath, getApplication<Application>().cacheDir.absolutePath)
                 }
+                // Restore the open thread's context into the freshly loaded engine.
+                val history = historyOfCurrent()
+                if (history.any { !it.first }) withContext(Dispatchers.IO) { engine.switchConversation(history) }
                 _state.update { it.copy(model = ModelState.Ready(backend, file.name)) }
             } catch (t: Throwable) {
                 _state.update { it.copy(model = ModelState.Failed(t.message ?: t.javaClass.simpleName)) }
             }
         }
     }
+
+    // ---------------------------------------------------------------- chat
 
     fun send(text: String) {
         val prompt = text.trim()
@@ -164,14 +280,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stopGenerating() {
         engine.cancel()
-    }
-
-    fun newChat() {
-        engine.cancel()
-        // Also drop the model's context, otherwise the next answer still "remembers" the old thread.
-        engine.resetConversation()
-        _state.update { it.copy(messages = emptyList(), notice = null) }
-        viewModelScope.launch(Dispatchers.IO) { store.clear() }
     }
 
     fun clearNotice() = _state.update { it.copy(notice = null) }

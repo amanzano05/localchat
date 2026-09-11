@@ -2,15 +2,19 @@ package fyi.amago.localchat
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
@@ -28,8 +32,10 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -39,7 +45,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -48,8 +53,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.launch
@@ -61,6 +68,7 @@ fun ChatScreen(vm: ChatViewModel) {
     val context = LocalContext.current
     var input by remember { mutableStateOf("") }
     var showModels by remember { mutableStateOf(false) }
+    var showChats by remember { mutableStateOf(false) }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) vm.importModel(context, uri)
@@ -68,18 +76,28 @@ fun ChatScreen(vm: ChatViewModel) {
 
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
-    // Only auto-scroll when the user is parked at the tail, so scrolling up while an answer
-    // streams no longer fights the user. Non-animated while streaming (one call per chunk).
-    val atTail by remember { derivedStateOf { !listState.canScrollForward } }
 
-    LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.text) {
-        if (state.messages.isNotEmpty() && atTail) listState.scrollToItem(state.messages.lastIndex)
+    // Autoscroll: follow the tail by default (and always right after you send). It only stops
+    // when *you* drag the list yourself, so reading back never fights the streaming answer.
+    var follow by remember { mutableStateOf(true) }
+    val dragging by listState.interactionSource.collectIsDraggedAsState()
+    LaunchedEffect(dragging) { if (dragging) follow = false }
+
+    LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.text, state.currentId) {
+        if (state.messages.isNotEmpty() && follow) listState.scrollToItem(state.messages.lastIndex)
+    }
+    LaunchedEffect(state.currentId) {
+        if (state.messages.isNotEmpty()) {
+            follow = true
+            listState.scrollToItem(state.messages.lastIndex)
+        }
     }
 
     val submit: () -> Unit = {
         val t = input
         if (t.isNotBlank() && !state.generating && state.model is ModelState.Ready) {
             input = ""
+            follow = true
             vm.send(t)
         }
     }
@@ -98,8 +116,8 @@ fun ChatScreen(vm: ChatViewModel) {
                     }
                 },
                 actions = {
+                    TextButton(onClick = { showChats = true }) { Text("Chats") }
                     TextButton(onClick = { showModels = !showModels }) { Text("Model") }
-                    TextButton(onClick = { vm.newChat() }) { Text("New") }
                 },
             )
         },
@@ -141,9 +159,12 @@ fun ChatScreen(vm: ChatViewModel) {
                     ) {
                         items(state.messages, key = { it.id }) { msg -> Bubble(msg) }
                     }
-                    if (!atTail) {
+                    if (!follow) {
                         TextButton(
-                            onClick = { scope.launch { listState.animateScrollToItem(state.messages.lastIndex) } },
+                            onClick = {
+                                follow = true
+                                scope.launch { listState.animateScrollToItem(state.messages.lastIndex) }
+                            },
                             modifier = Modifier.align(Alignment.BottomCenter),
                         ) {
                             Text("↓ Jump to latest", style = MaterialTheme.typography.labelSmall)
@@ -181,6 +202,74 @@ fun ChatScreen(vm: ChatViewModel) {
                 }
             }
         }
+    }
+
+    if (showChats) {
+        ModalBottomSheet(onDismissRequest = { showChats = false }) {
+            ChatsSheet(
+                state = state,
+                onNew = {
+                    vm.newChat()
+                    follow = true
+                    showChats = false
+                },
+                onOpen = { id ->
+                    vm.openConversation(id)
+                    follow = true
+                    showChats = false
+                },
+                onDelete = { id -> vm.deleteConversation(id) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ChatsSheet(
+    state: ChatUiState,
+    onNew: () -> Unit,
+    onOpen: (String) -> Unit,
+    onDelete: (String) -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Chats", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+            Button(onClick = onNew) { Text("New chat") }
+        }
+        Spacer(Modifier.height(8.dp))
+        if (state.conversations.isEmpty()) {
+            Text("No conversations yet.", style = MaterialTheme.typography.bodySmall)
+        } else {
+            LazyColumn(modifier = Modifier.fillMaxWidth()) {
+                items(state.conversations, key = { it.id }) { c ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onOpen(c.id) }
+                            .padding(vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = c.title,
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = if (c.id == state.currentId) FontWeight.Bold else FontWeight.Normal,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                text = "${c.messageCount} messages · ${whenLabel(c.updatedAt)}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        TextButton(onClick = { onDelete(c.id) }) { Text("Delete") }
+                    }
+                    HorizontalDivider()
+                }
+            }
+        }
+        Spacer(Modifier.height(24.dp))
     }
 }
 
@@ -283,6 +372,15 @@ private fun timeLabel(ms: Long): String =
     if (ms <= 0L) "" else java.time.Instant.ofEpochMilli(ms)
         .atZone(java.time.ZoneId.systemDefault())
         .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"))
+
+private fun whenLabel(ms: Long): String {
+    if (ms <= 0L) return ""
+    val zone = java.time.ZoneId.systemDefault()
+    val dt = java.time.Instant.ofEpochMilli(ms).atZone(zone)
+    val today = java.time.LocalDate.now(zone)
+    return if (dt.toLocalDate() == today) dt.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"))
+    else dt.format(java.time.format.DateTimeFormatter.ofPattern("MM-dd HH:mm"))
+}
 
 private fun mb(bytes: Long): String = if (bytes <= 0) "0 MB" else String.format("%.1f MB", bytes / 1048576.0)
 

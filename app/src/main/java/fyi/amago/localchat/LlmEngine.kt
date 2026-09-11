@@ -8,6 +8,7 @@ import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.LogSeverity
+import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.SamplerConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -79,18 +80,31 @@ class LlmEngine {
      * Engine). Without this, "New chat" only cleared the UI while the model kept answering
      * with the old thread still in its context.
      */
-    fun resetConversation(): Boolean {
+    fun resetConversation(): Boolean = switchConversation(emptyList())
+
+    /**
+     * Rebuilds the Conversation on the same loaded Engine, seeding it with [history]
+     * (pairs of isUser to text) so switching back to an old chat keeps its context —
+     * otherwise the model would answer as if the thread never happened.
+     */
+    fun switchConversation(history: List<Pair<Boolean, String>>): Boolean {
         val e = engine ?: return false
         runCatching {
             conversation?.cancelProcess()
             conversation?.close()
         }
-        conversation = runCatching { e.createConversation(newConversationConfig()) }.getOrNull()
+        conversation = runCatching { e.createConversation(newConversationConfig(history)) }.getOrNull()
         return conversation != null
     }
 
-    private fun newConversationConfig() = ConversationConfig(
+    private fun newConversationConfig(
+        history: List<Pair<Boolean, String>> = emptyList(),
+    ) = ConversationConfig(
         systemInstruction = Contents.of(SYSTEM_PROMPT),
+        // Replay only the tail of the thread: enough for continuity, cheap on context.
+        initialMessages = history.takeLast(HISTORY_REPLAY_LIMIT).map { (fromUser, text) ->
+            if (fromUser) Message.user(text) else Message.model(text)
+        },
         samplerConfig = SamplerConfig(topK = 40, topP = 0.95, temperature = 1.0, seed = 0),
     )
 
@@ -102,6 +116,7 @@ class LlmEngine {
     }
 
     companion object {
+        private const val HISTORY_REPLAY_LIMIT = 20
         const val SYSTEM_PROMPT =
             "You are a concise, helpful assistant running entirely on the user's phone. " +
                 "Answer directly and keep answers short unless asked for detail."
