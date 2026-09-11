@@ -1,0 +1,11 @@
+# Never commit signing material or local SDK paths
+keystore.properties
+keys/
+local.properties
+.gradle/
+build/
+app/build/
+*.apk
+*.jks
+.kotlin/
+*.log
