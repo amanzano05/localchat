@@ -43,12 +43,7 @@ class LlmEngine {
                     )
                     val e = Engine(cfg)
                     e.initialize()
-                    val c = e.createConversation(
-                        ConversationConfig(
-                            systemInstruction = Contents.of(SYSTEM_PROMPT),
-                            samplerConfig = SamplerConfig(topK = 40, topP = 0.95, temperature = 1.0, seed = 0),
-                        )
-                    )
+                    val c = e.createConversation(newConversationConfig())
                     engine = e
                     conversation = c
                     return@withContext if (useGpu) "GPU" else "CPU"
@@ -78,6 +73,26 @@ class LlmEngine {
     fun cancel() {
         runCatching { conversation?.cancelProcess() }
     }
+
+    /**
+     * Drops the model's conversation context entirely (fresh Conversation on the same loaded
+     * Engine). Without this, "New chat" only cleared the UI while the model kept answering
+     * with the old thread still in its context.
+     */
+    fun resetConversation(): Boolean {
+        val e = engine ?: return false
+        runCatching {
+            conversation?.cancelProcess()
+            conversation?.close()
+        }
+        conversation = runCatching { e.createConversation(newConversationConfig()) }.getOrNull()
+        return conversation != null
+    }
+
+    private fun newConversationConfig() = ConversationConfig(
+        systemInstruction = Contents.of(SYSTEM_PROMPT),
+        samplerConfig = SamplerConfig(topK = 40, topP = 0.95, temperature = 1.0, seed = 0),
+    )
 
     fun close() {
         runCatching { conversation?.close() }

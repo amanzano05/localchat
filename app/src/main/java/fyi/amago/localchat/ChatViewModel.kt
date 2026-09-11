@@ -168,6 +168,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun newChat() {
         engine.cancel()
+        // Also drop the model's context, otherwise the next answer still "remembers" the old thread.
+        engine.resetConversation()
         _state.update { it.copy(messages = emptyList(), notice = null) }
         viewModelScope.launch(Dispatchers.IO) { store.clear() }
     }
