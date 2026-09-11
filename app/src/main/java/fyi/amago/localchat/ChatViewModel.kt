@@ -19,6 +19,7 @@ data class ChatMessage(
     val fromUser: Boolean,
     val text: String = "",
     val streaming: Boolean = false,
+    val timeMs: Long = 0L,
 )
 
 sealed interface ModelState {
@@ -40,6 +41,7 @@ data class ChatUiState(
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private val repo = ModelRepository(app)
+    private val store = ChatStore(app)
     private val engine = LlmEngine()
 
     private val _state = MutableStateFlow(ChatUiState())
@@ -48,9 +50,19 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private var nextId = 0L
 
     init {
+        // Restore the previous conversation before anything else, so the screen never flashes empty.
+        val restored = store.load()
+        nextId = (restored.maxOfOrNull { it.id } ?: -1L) + 1
+        _state.update { it.copy(messages = restored) }
+
         refreshModels()
         val default = repo.modelFile(ModelRepository.DEFAULT_MODEL_NAME)
         if (repo.isInstalled(default.name)) loadModel(default)
+    }
+
+    private fun persist() {
+        val snapshot = _state.value.messages
+        viewModelScope.launch(Dispatchers.IO) { store.save(snapshot) }
     }
 
     private fun refreshModels() {
@@ -72,9 +84,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 refreshModels()
                 loadModel(file)
             } catch (t: Throwable) {
-                _state.update {
-                    it.copy(model = ModelState.Failed(t.message ?: "Download failed"))
-                }
+                _state.update { it.copy(model = ModelState.Failed(t.message ?: "Download failed")) }
             }
         }
     }
@@ -84,7 +94,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val name = queryDisplayName(context, uri) ?: ModelRepository.DEFAULT_MODEL_NAME
                 val safeName = if (name.endsWith(ModelRepository.MODEL_EXTENSION)) name else "$name${ModelRepository.MODEL_EXTENSION}"
-                _state.update { it.copy(model = ModelState.Loading, notice = "Importing $safeName…") }
+                _state.update { it.copy(model = ModelState.Loading, notice = "Importing $safeName\u2026") }
                 val file = withContext(Dispatchers.IO) { repo.importFromUri(uri, safeName) }
                 refreshModels()
                 _state.update { it.copy(notice = null) }
@@ -104,9 +114,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 _state.update { it.copy(model = ModelState.Ready(backend, file.name)) }
             } catch (t: Throwable) {
-                _state.update {
-                    it.copy(model = ModelState.Failed(t.message ?: t.javaClass.simpleName))
-                }
+                _state.update { it.copy(model = ModelState.Failed(t.message ?: t.javaClass.simpleName)) }
             }
         }
     }
@@ -116,14 +124,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val st = _state.value
         if (prompt.isEmpty() || st.generating || st.model !is ModelState.Ready) return
 
+        val now = System.currentTimeMillis()
         val botId = nextId++
         _state.update {
             it.copy(
-                messages = it.messages + ChatMessage(nextId++, true, prompt) +
-                    ChatMessage(botId, false, "", streaming = true),
+                messages = it.messages + ChatMessage(nextId++, true, prompt, timeMs = now) +
+                    ChatMessage(botId, false, "", streaming = true, timeMs = now),
                 generating = true,
             )
         }
+        persist()
 
         viewModelScope.launch {
             try {
@@ -143,10 +153,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             } finally {
                 _state.update { s ->
                     s.copy(
-                        messages = s.messages.map { if (it.id == botId) it.copy(streaming = false) else it },
+                        messages = s.messages.map { if (it.id == botId) it.copy(streaming = false, timeMs = System.currentTimeMillis()) else it },
                         generating = false,
                     )
                 }
+                persist()
             }
         }
     }
@@ -158,6 +169,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun newChat() {
         engine.cancel()
         _state.update { it.copy(messages = emptyList(), notice = null) }
+        viewModelScope.launch(Dispatchers.IO) { store.clear() }
     }
 
     fun clearNotice() = _state.update { it.copy(notice = null) }

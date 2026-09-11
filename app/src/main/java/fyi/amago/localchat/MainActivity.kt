@@ -4,8 +4,10 @@ import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.darkColorScheme
@@ -13,6 +15,7 @@ import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 
 class MainActivity : ComponentActivity() {
@@ -20,6 +23,9 @@ class MainActivity : ComponentActivity() {
     private val vm: ChatViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Edge-to-edge: the window no longer resizes itself for the keyboard, which is what
+        // lets Compose lift the input row above the IME via Modifier.imePadding().
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         setContent {
             AppTheme { ChatScreen(vm) }
@@ -37,6 +43,6 @@ private fun AppTheme(content: @Composable () -> Unit) {
         if (dark) darkColorScheme() else lightColorScheme()
     }
     MaterialTheme(colorScheme = colors) {
-        Surface(color = MaterialTheme.colorScheme.background, content = content)
+        Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background, content = content)
     }
 }

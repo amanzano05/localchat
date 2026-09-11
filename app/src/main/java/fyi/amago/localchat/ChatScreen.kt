@@ -2,12 +2,14 @@ package fyi.amago.localchat
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -16,6 +18,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
@@ -38,7 +41,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
@@ -75,7 +78,8 @@ fun ChatScreen(vm: ChatViewModel) {
             )
         },
     ) { padding ->
-        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+        // imePadding() lifts the whole column (input row included) above the keyboard.
+        Column(modifier = Modifier.fillMaxSize().padding(padding).imePadding()) {
 
             if (showModels || state.model !is ModelState.Ready) {
                 ModelPanel(vm = vm, state = state, onPickFile = { picker.launch(arrayOf("*/*")) })
@@ -85,18 +89,32 @@ fun ChatScreen(vm: ChatViewModel) {
                 Text(it, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp), style = MaterialTheme.typography.bodySmall)
             }
 
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.weight(1f).fillMaxWidth(),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                items(state.messages, key = { it.id }) { msg -> Bubble(msg) }
+            if (state.messages.isEmpty()) {
+                Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    Text(
+                        text = if (state.model is ModelState.Ready)
+                            "Ask anything.\nIt never leaves your phone."
+                        else
+                            "Load a model to start chatting.",
+                        textAlign = TextAlign.Center,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    items(state.messages, key = { it.id }) { msg -> Bubble(msg) }
+                }
             }
 
             Row(
                 modifier = Modifier.fillMaxWidth().padding(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
+                verticalAlignment = Alignment.Bottom,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 OutlinedTextField(
@@ -107,6 +125,7 @@ fun ChatScreen(vm: ChatViewModel) {
                     enabled = state.model is ModelState.Ready && !state.generating,
                     keyboardActions = KeyboardActions(),
                     maxLines = 5,
+                    shape = RoundedCornerShape(24.dp),
                 )
                 if (state.generating) {
                     OutlinedButton(onClick = { vm.stopGenerating() }) { Text("Stop") }
@@ -169,10 +188,7 @@ private fun ModelPanel(vm: ChatViewModel, state: ChatUiState, onPickFile: () -> 
                 state.models.forEach { f ->
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(f.name + " (" + mb(f.length()) + ")", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
-                        TextButton(
-                            onClick = { vm.loadModel(f) },
-                            enabled = state.model !is ModelState.Loading,
-                        ) { Text("Load") }
+                        TextButton(onClick = { vm.loadModel(f) }, enabled = state.model !is ModelState.Loading) { Text("Load") }
                     }
                 }
             }
@@ -190,12 +206,25 @@ private fun Bubble(msg: ChatMessage) {
     // Alignment.End/Start are Alignment.Horizontal; CenterEnd/CenterStart are plain Alignment here.
     val align: Alignment.Horizontal = if (msg.fromUser) Alignment.End else Alignment.Start
     val bg = if (msg.fromUser) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
+    val fg = if (msg.fromUser) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
     Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = align) {
-        Surface(color = bg, shape = RoundedCornerShape(14.dp), modifier = Modifier.widthIn(max = 320.dp)) {
+        Surface(color = bg, shape = RoundedCornerShape(18.dp), modifier = Modifier.widthIn(max = 320.dp)) {
+            SelectionContainer {
+                Text(
+                    text = if (msg.text.isEmpty() && msg.streaming) "…" else msg.text,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = fg,
+                )
+            }
+        }
+        val stamp = if (msg.streaming) "…" else timeLabel(msg.timeMs)
+        if (stamp.isNotEmpty()) {
             Text(
-                text = if (msg.text.isEmpty() && msg.streaming) "…" else msg.text,
-                modifier = Modifier.padding(10.dp),
-                style = MaterialTheme.typography.bodyMedium,
+                stamp,
+                modifier = Modifier.padding(top = 2.dp, start = 6.dp, end = 6.dp),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }
@@ -208,6 +237,11 @@ private fun modelSubtitle(m: ModelState): String = when (m) {
     is ModelState.Ready -> "on-device · ${m.backend}"
     is ModelState.Failed -> "error"
 }
+
+private fun timeLabel(ms: Long): String =
+    if (ms <= 0L) "" else java.time.Instant.ofEpochMilli(ms)
+        .atZone(java.time.ZoneId.systemDefault())
+        .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"))
 
 private fun mb(bytes: Long): String = if (bytes <= 0) "0 MB" else String.format("%.1f MB", bytes / 1048576.0)
 
