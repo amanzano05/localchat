@@ -33,9 +33,22 @@ class TtsEngine(private val repo: VoiceRepository) {
 
     private var tts: OfflineTts? = null
     private var loadedLang: String? = null
-    private var track: AudioTrack? = null
     private val speaking = AtomicBoolean(false)
     private val stopping = AtomicBoolean(false)
+
+    /**
+     * Serialises everything that touches the native engine. Two things were racing here and both
+     * end in the same place — a freed ONNX session in use:
+     *
+     * - `load()` used to `close()` the old engine while a synthesis was still running on the IO
+     *   thread (press "Test voice" mid-answer, or just reply quickly).
+     * - `close()` released the engine from the main thread while `speak()` was mid-generation.
+     *
+     * A lock is the whole fix; the release that has to wait is deferred to the end of the utterance.
+     */
+    private val engineLock = Any()
+
+    @Volatile private var pendingClose = false
 
     @Volatile var lastError: String? = null
         private set
@@ -75,9 +88,11 @@ class TtsEngine(private val repo: VoiceRepository) {
      * Loads the voice for [lang]. Returns false (with [lastError] set) when the voice is not
      * installed or the engine refuses to come up.
      */
-    fun load(lang: String, espeakDir: String): Boolean {
+    fun load(lang: String, espeakDir: String): Boolean = synchronized(engineLock) { loadLocked(lang, espeakDir) }
+
+    private fun loadLocked(lang: String, espeakDir: String): Boolean {
         if (tts != null && loadedLang == lang) return true
-        close()
+        releaseEngine()
         if (!repo.ttsInstalled(lang)) {
             lastError = "Voice for $lang is not downloaded"
             return false
@@ -150,6 +165,16 @@ class TtsEngine(private val repo: VoiceRepository) {
     fun speak(text: String, lang: String, espeakDir: String, speed: Float = 1.0f) {
         val clean = text.trim()
         if (clean.isEmpty()) return
+        synchronized(engineLock) {
+            if (pendingClose) {
+                releaseEngine()
+                pendingClose = false
+            }
+            speakLocked(clean, lang, espeakDir, speed)
+        }
+    }
+
+    private fun speakLocked(clean: String, lang: String, espeakDir: String, speed: Float) {
         if (!load(lang, espeakDir)) return
         val engine = tts ?: return
 
@@ -214,8 +239,18 @@ class TtsEngine(private val repo: VoiceRepository) {
             speaking.set(false)
             finished.set(true)
             queue.offer(FloatArray(0))
-            runCatching { writer.join(3_000) }
-            closeTrack(out)
+            runCatching { writer.join(5_000) }
+            if (writer.isAlive) {
+                // Freeing a track another thread may still be writing to is a native crash.
+                // Leaking one AudioTrack is cheap; killing the app is not.
+                log("writer still busy after 5s: not releasing the track")
+            } else {
+                closeTrack(out)
+            }
+            if (pendingClose) {
+                releaseEngine()
+                pendingClose = false
+            }
             writerError.get()?.let {
                 lastError = "Audio output failed: $it"
                 log("WRITER ERROR: $it")
@@ -292,7 +327,6 @@ class TtsEngine(private val repo: VoiceRepository) {
         runCatching { if (out.playState != AudioTrack.PLAYSTATE_STOPPED) out.stop() }
         runCatching { out.flush() }
         runCatching { out.release() }
-        if (track === out) track = null
     }
 
     /** Barge-in: stop mid-word. Safe from any thread; the writer notices and unwinds. */
@@ -303,7 +337,18 @@ class TtsEngine(private val repo: VoiceRepository) {
 
     fun close() {
         stop()
-        runCatching { track?.pause() }
+        if (speaking.get()) {
+            // Do not take the lock here: close() is called from the main thread, and waiting on a
+            // half-minute of synthesis would freeze the UI. Hand the job to the running speak().
+            pendingClose = true
+            log("close deferred until the current utterance ends")
+            return
+        }
+        synchronized(engineLock) { releaseEngine() }
+    }
+
+    /** Caller must hold [engineLock]. */
+    private fun releaseEngine() {
         runCatching { tts?.release() }
         tts = null
         loadedLang = null

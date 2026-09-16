@@ -41,16 +41,17 @@ data class VoiceModelsState(
 /**
  * The conductor: microphone → Whisper → (the chat model, elsewhere) → Piper → speaker.
  *
- * It owns no UI and no chat state. The screen asks it to listen, gets text back, and asks it to
- * speak; the ViewModel decides what that text means. Both engines stay warm between turns, so a
- * conversation does not pay model-load time per turn.
+ * Speech *recognition* runs here, in the app process: it is stable and its output is needed on this
+ * side. Speech *synthesis* runs in [TtsService], in its own process, because that native stack was
+ * killing the app — see [TtsClient]. The screen asks this class to listen, gets text back, and asks
+ * it to speak; the ViewModel decides what that text means.
  */
 class VoiceController(private val context: Context) {
 
     private val repo = VoiceRepository(context)
     private val recorder = VoiceRecorder()
     private val stt = SttEngine(repo)
-    private val tts = TtsEngine(repo)
+    private val ttsClient = TtsClient(context)
     private val prefs = context.getSharedPreferences("voice", Context.MODE_PRIVATE)
 
     private val _state = MutableStateFlow<VoiceState>(VoiceState.Idle)
@@ -77,8 +78,8 @@ class VoiceController(private val context: Context) {
                 sttInstalled = repo.sttInstalled(),
                 ttsEnInstalled = repo.ttsInstalled("en"),
                 ttsEsInstalled = repo.ttsInstalled("es"),
-                voiceLog = tts.logTail(8),
-                voiceError = tts.lastError,
+                voiceLog = logTail(8),
+                voiceError = ttsClient.lastError,
             )
         }
     }
@@ -86,21 +87,21 @@ class VoiceController(private val context: Context) {
     fun setLang(lang: String) {
         _lang.value = if (lang == "es") "es" else "en"
         prefs.edit().putString(KEY_LANG, _lang.value).apply()
-        // A different language is a different voice; drop the loaded one so it reloads on demand.
-        tts.close()
+        // A different language is a different voice; the speech process reloads it on demand.
+        ttsClient.stop()
     }
 
     fun setSpeakReplies(on: Boolean) {
         _speakReplies.value = on
         prefs.edit().putBoolean(KEY_SPEAK, on).apply()
-        if (!on) tts.stop()
+        if (!on) ttsClient.stop()
     }
 
     // --- microphone ------------------------------------------------------------------------
 
     /** Starts capturing. Returns false (and sets [VoiceState.Failed]) if capture cannot start. */
     fun startListening(): Boolean {
-        tts.stop() // barge-in: talking over the assistant is how you interrupt it
+        ttsClient.stop() // barge-in: talking over the assistant is how you interrupt it
         if (!repo.sttInstalled()) {
             _state.value = VoiceState.Failed("Speech model not downloaded yet")
             return false
@@ -141,12 +142,12 @@ class VoiceController(private val context: Context) {
         val text = withContext(Dispatchers.IO) {
             if (!stt.load()) "" else stt.transcribe(samples)
         }
-        Log.i(TAG, "transcribed ${"%.1f".format(seconds)}s of audio in ${System.currentTimeMillis() - started} ms")
+        log("transcribed ${"%.1f".format(seconds)}s of audio in ${System.currentTimeMillis() - started} ms")
         _state.value = VoiceState.Idle
         return text
     }
 
-    // --- speaker ---------------------------------------------------------------------------
+    // --- speaker (in the speech process) ---------------------------------------------------
 
     /** Speaks [text] and suspends until the last word is out (or it is stopped). */
     suspend fun speak(text: String) {
@@ -159,79 +160,50 @@ class VoiceController(private val context: Context) {
             fail("Voice data missing")
             return
         }
-        // Deliberately no stt.close() here. Releasing the Whisper recogniser immediately before
-        // creating the Piper engine tears down ONNX Runtime's shared environment inside the same
-        // native library, and the next session is built on freed memory: instant segfault. The
-        // memory saving is ~100 MB; the cost was the whole app. Learnt from the device log.
         _state.value = VoiceState.Speaking(System.currentTimeMillis())
-        tts.log("speak ${clean.length} chars, stt loaded=${stt.isLoaded}")
-        tts.logMemory("speak requested")
-        withContext(Dispatchers.IO) {
-            if (tts.load(_lang.value, espeak)) tts.speak(clean, _lang.value, espeak)
+        log("asking the voice process to speak ${clean.length} chars")
+        val ok = ttsClient.speak(clean, _lang.value, espeak)
+        if (ok) {
+            _state.value = VoiceState.Idle
+            _models.update { it.copy(voiceError = null) }
+        } else {
+            fail(ttsClient.lastError ?: "the voice engine failed")
         }
-        tts.lastError?.let { fail(it) } ?: run { _state.value = VoiceState.Idle }
-        _models.update { it.copy(voiceError = tts.lastError) }
     }
 
     private fun fail(message: String) {
         _state.value = VoiceState.Failed(message)
         _models.update { it.copy(voiceError = message) }
-        tts.log("FAILED $message")
+        log("FAILED $message")
     }
-
-    /**
-     * The self-check the sheet offers: are the files there, does the engine come up, does it
-     * actually make sound. Reports in plain sentences so a problem can be described without a cable.
-     */
-    suspend fun runVoiceCheck(): String {
-        val report = StringBuilder()
-        val sttSet = repo.installedStt()
-        report.append("speech to text: ").append(sttSet?.label ?: "missing").append('\n')
-
-        val espeak = withContext(Dispatchers.IO) {
-            runCatching { repo.ensureEspeakData(context.assets) }.getOrNull()
-        }
-        val lang = _lang.value
-        if (espeak == null) {
-            report.append("phoneme data: MISSING (could not be unpacked)\n")
-        } else {
-            val count = espeak.walkTopDown().count { it.isFile }
-            val core = listOf("phontab", "phondata", "phonindex", "intonations").all { File(espeak, it).isFile }
-            report.append("phoneme data: ").append(count).append(" files, core complete=").append(core).append('\n')
-        }
-
-        val installed = repo.ttsInstalled(lang)
-        val voiceSize = if (installed) "${repo.ttsModelFile(lang).length() / 1_048_576} MB" else "missing"
-        report.append("voice (").append(lang).append("): ").append(voiceSize).append('\n')
-
-        if (espeak != null && installed) {
-            val loaded = withContext(Dispatchers.IO) { tts.load(lang, espeak.absolutePath) }
-            report.append("engine: ").append(if (loaded) "loaded" else "FAILED \u2014 " + (tts.lastError ?: "unknown")).append('\n')
-            if (loaded) {
-                val started = System.currentTimeMillis()
-                withContext(Dispatchers.IO) { tts.speak("Voice test, one two three.", lang, espeak.absolutePath) }
-                val ms = System.currentTimeMillis() - started
-                val err = tts.lastError
-                report.append("synthesis: ").append(if (err == null) "ok in ${ms} ms" else "FAILED \u2014 $err").append('\n')
-            }
-        } else if (!installed) {
-            report.append("Download the voice, then run the test again.\n")
-        }
-
-        report.append("log:\n").append(tts.logTail(8))
-        val text = report.toString()
-        _models.update { it.copy(lastCheck = text, voiceError = tts.lastError) }
-        return text
-    }
-
-    fun logTail(lines: Int = 10): String = tts.logTail(lines)
 
     fun stopSpeaking() {
-        tts.stop()
+        ttsClient.stop()
         if (_state.value is VoiceState.Speaking) _state.value = VoiceState.Idle
     }
 
-    fun isSpeaking(): Boolean = tts.isSpeaking
+    fun isSpeaking(): Boolean = ttsClient.isSpeaking
+
+    /**
+     * The self-check the sheet offers: files, engine, and a spoken test sentence, run *inside the
+     * speech process* and reported in plain sentences.
+     */
+    suspend fun runVoiceCheck(): String {
+        val report = ttsClient.testVoice(_lang.value)
+        _models.update { it.copy(lastCheck = report, voiceError = ttsClient.lastError, voiceLog = logTail(8)) }
+        return report
+    }
+
+    fun logTail(lines: Int = 10): String = runCatching {
+        File(repo.root, "voice.log").readLines().takeLast(lines).joinToString("\n")
+    }.getOrDefault("")
+
+    /** App-side lines go into the same file as the speech process's, tagged so they can be told apart. */
+    fun log(line: String) {
+        val stamp = java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+        runCatching { File(repo.root, "voice.log").appendText("$stamp  [app] $line\n") }
+        Log.i(TAG, line)
+    }
 
     // --- downloads -------------------------------------------------------------------------
 
@@ -293,7 +265,7 @@ class VoiceController(private val context: Context) {
     fun close() {
         if (recorder.isRecording) recorder.stop()
         stt.close()
-        tts.close()
+        ttsClient.close()
     }
 
     private fun mb(bytes: Long): String = "%.0f MB".format(bytes / 1_048_576.0)

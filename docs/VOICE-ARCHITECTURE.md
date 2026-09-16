@@ -118,6 +118,39 @@ Two supporting rules came out of the same night:
   A crash that names its own location is worth more than any amount of theorising: this log line is
   what turned "the app dies" into a one-line fix.
 
+## Why synthesis lives in its own process
+
+Even after the callback and the teardown bugs were fixed, the app still died — always in the same
+place: the voice starting *right after* the language model had finished an answer. Standalone
+("Test voice", model idle) it was fine. Text-only chat with speak-replies on: dead. That is a
+collision between two native stacks — LiteRT-LM's session and ONNX Runtime's — sharing one
+process, and it is not a bug we can fix by reading our own code, because the crash happens inside
+code neither of us wrote, with no Java exception and no stack trace.
+
+So the third-party stack was moved out:
+
+```
+:main process                          :speech process
+  ChatScreen · ChatViewModel             TtsService
+  LlmEngine (Gemma, ~1.9 GB)             TtsEngine (Piper + espeak + ONNX Runtime)
+  SttEngine (Whisper)                    AudioTrack
+        │  Messenger: speak / stop / test      │
+        └──────────────►  ─────────────────────┘
+        ◄──────────────  state + result + death notice
+```
+
+Consequences, in order of importance:
+
+1. **A native crash there can no longer kill the chat.** Android kills the `:speech` process; the
+   app gets a death notice on its binder, shows one sentence, and rebinds on the next answer.
+2. **Different memory budgets.** The voice no longer competes with a 1.9 GB model inside one
+   process limit.
+3. **The diagnosis gets honest.** If the app itself still dies, the crash is *not* in the voice path
+   — which is information we could not obtain while everything shared one address space.
+
+Recognition stays in `:main`: it is stable, and its output is needed here anyway. Only the part
+that proved dangerous pays the IPC cost.
+
 ## Behaviour rules that are not styling
 
 - **A silent take never sends.** Under 0.25 s of audio, or an empty transcript, produces
