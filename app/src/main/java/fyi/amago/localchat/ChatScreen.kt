@@ -10,6 +10,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -22,6 +24,8 @@ import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
@@ -43,6 +47,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -313,6 +318,12 @@ fun ChatScreen(vm: ChatViewModel) {
                     showSettings = false
                 },
                 onReset = { vm.resetPrompt() },
+                onSaveAndStartNewChat = {
+                    // Save, apply, then a clean thread: the model starts over with its new manners.
+                    vm.applyPrompt()
+                    vm.newChat()
+                    showSettings = false
+                },
             )
         }
     }
@@ -885,12 +896,96 @@ private fun VoiceProblemCard(message: String, log: String, onDismiss: () -> Unit
 }
 
 
+// --- imports que hay que AÑADIR a la lista de ChatScreen.kt (los demás ya están) ---
+
+/** Los textos de la hoja, ES/EN; `lang` decide cuál. Añadir un idioma = añadir un val. */
+private data class SettingsCopy(
+    val title: String,
+    val subtitle: String,
+    val fieldLabel: String,
+    val helper: String,
+    val empty: String,
+    val tooLong: String,
+    val saved: String,
+    val factory: String,
+    val unsaved: String,
+    val chars: String,
+    val tokens: String,
+    val save: String,
+    val apply: String,
+    val reset: String,
+    val resetNote: String,
+    val saveAndNew: String,
+    val saveAndNewNote: String,
+    val examplesTitle: String,
+    val examplesNote: String,
+    val use: String,
+    val voiceNote: String,
+)
+
+private val SettingsCopyEs = SettingsCopy(
+    title = "Ajustes",
+    subtitle = "Cómo quieres que se comporte el modelo: persona, intención, tono, idioma, reglas.",
+    fieldLabel = "Instrucciones para el modelo",
+    helper = "El modelo las lee antes de cada conversación. Escribe en el idioma en el que quieres que te responda.",
+    empty = "El texto en gris de arriba es la instrucción de fábrica: se usa mientras este campo esté vacío.",
+    tooLong = "Muy largas: dejan menos sitio para la conversación y el modelo puede perder el hilo.",
+    saved = "Guardado y en uso",
+    factory = "Instrucción de fábrica en uso",
+    unsaved = "Sin guardar",
+    chars = "caracteres",
+    tokens = "tokens",
+    save = "Guardar y aplicar",
+    apply = "Aplicar",
+    reset = "Restablecer",
+    resetNote = "Restablecer vuelve a la instrucción de fábrica; se aplica al pulsar Guardar y aplicar.",
+    saveAndNew = "Guardar y empezar un chat nuevo",
+    saveAndNewNote = "Borra el historial de este chat y el modelo arranca de cero con estas instrucciones.",
+    examplesTitle = "Ejemplos",
+    examplesNote = "Toca uno para ponerlo en el campo y edítalo a tu gusto.",
+    use = "Usar",
+    voiceNote = "Responder en voz alta, manos libres y el idioma de la voz se ajustan en Voice (menú ⋮).",
+)
+
+private val SettingsCopyEn = SettingsCopy(
+    title = "Settings",
+    subtitle = "How you want the model to behave: persona, intent, tone, language, rules.",
+    fieldLabel = "Instructions for the model",
+    helper = "The model reads these before every conversation. Write in the language you want it to answer in.",
+    empty = "The grey text above is the built-in instruction: it is used while this box stays empty.",
+    tooLong = "Very long: less room left for the conversation itself, and the model may lose the thread.",
+    saved = "Saved and in use",
+    factory = "Built-in instruction in use",
+    unsaved = "Not saved",
+    chars = "characters",
+    tokens = "tokens",
+    save = "Save and apply",
+    apply = "Apply",
+    reset = "Reset",
+    resetNote = "Reset goes back to the built-in instruction; it takes effect when you press Save and apply.",
+    saveAndNew = "Save and start a new chat",
+    saveAndNewNote = "Clears this chat's history; the model starts fresh with these instructions.",
+    examplesTitle = "Examples",
+    examplesNote = "Tap one to put it in the box, then edit it as you like.",
+    use = "Use",
+    voiceNote = "Spoken replies, hands-free and the voice language live in Voice (⋮ menu).",
+)
+
+/** A partir de aquí las instrucciones empiezan a comerse el contexto de la conversación. */
+private const val PROMPT_SOFT_CHARS = 1200
+
 /**
- * Ajustes: the instructions the model gets before every conversation.
+ * Ajustes: the instructions the model is given before every conversation.
  *
- * The model reads them when a conversation is created, so saving rebuilds the current one with the
- * thread replayed into it — the chat keeps its memory, the model changes its manners. Empty means
- * "use the built-in instruction", which is why the box shows it as a placeholder instead of text.
+ * Two facts shape the states and the copy. First, the model only reads its instructions when a
+ * conversation is created, so "apply" rebuilds the current one with the thread replayed into it —
+ * the chat keeps its context, the model changes its manners. That is also why nothing is saved
+ * while the user types: every save costs a conversation rebuild. Second, an empty box is not an
+ * error but a legitimate state ("use the built-in instruction"), so the built-in text sits in the
+ * placeholder in grey and an empty box can still be applied.
+ *
+ * Everything is hoisted: the sheet holds no state of its own, the ViewModel owns the draft, the
+ * saved value and whether the two differ.
  */
 @Composable
 private fun SettingsSheet(
@@ -901,18 +996,61 @@ private fun SettingsSheet(
     onPromptChange: (String) -> Unit,
     onApply: () -> Unit,
     onReset: () -> Unit,
+    onSaveAndStartNewChat: () -> Unit,
+    lang: String = "es",
 ) {
-    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
-        Text("Ajustes", style = MaterialTheme.typography.titleLarge)
+    val c = if (lang.startsWith("en", ignoreCase = true)) SettingsCopyEn else SettingsCopyEs
+    val empty = prompt.isBlank()
+    val chars = prompt.trim().length
+    val tokens = (chars + 3) / 4
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            // The box is tall: with the keyboard up the sheet has to scroll, not hide the text.
+            .imePadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp),
+    ) {
+        Text(c.title, style = MaterialTheme.typography.titleLarge)
         Spacer(Modifier.height(4.dp))
         Text(
-            "Cómo quieres que se comporte el modelo. Persona, intención, tono, idioma\u2026 lo que le dirías a alguien antes de empezar a trabajar con él.",
+            c.subtitle,
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
         Spacer(Modifier.height(16.dp))
-        Text("Instrucciones para el modelo", style = MaterialTheme.typography.labelMedium)
+
+        // State sits above the box: "does the model already know this?" is the first question,
+        // and it is answered with a dot *and* a word, never colour alone.
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Surface(
+                modifier = Modifier.size(8.dp),
+                shape = CircleShape,
+                color = if (dirty) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.tertiary,
+            ) {}
+            Spacer(Modifier.size(8.dp))
+            Text(
+                text = when {
+                    dirty -> c.unsaved
+                    empty -> c.factory
+                    else -> c.saved
+                },
+                style = MaterialTheme.typography.labelMedium,
+                color = if (dirty) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.tertiary,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                text = "$chars ${c.chars} · ≈$tokens ${c.tokens}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        Text(c.fieldLabel, style = MaterialTheme.typography.labelMedium)
         Spacer(Modifier.height(6.dp))
         OutlinedTextField(
             value = prompt,
@@ -922,35 +1060,55 @@ private fun SettingsSheet(
                 Text(
                     defaultPrompt,
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
                 )
             },
-            minLines = 5,
+            // A prose box, not a form row: six lines to start, twelve before it scrolls inside.
+            minLines = 6,
             maxLines = 12,
-            shape = RoundedCornerShape(14.dp),
+            textStyle = MaterialTheme.typography.bodyLarge,
+            shape = RoundedCornerShape(20.dp),
             supportingText = {
                 Text(
                     when {
-                        prompt.isBlank() -> "Vacío: se usa la instrucción de fábrica (arriba, en gris)"
-                        dirty -> "${prompt.trim().length} caracteres \u00b7 sin guardar"
-                        else -> "${prompt.trim().length} caracteres \u00b7 aplicadas"
+                        empty -> c.empty
+                        chars > PROMPT_SOFT_CHARS -> c.tooLong
+                        else -> c.helper
                     },
                     style = MaterialTheme.typography.labelSmall,
-                    color = if (dirty) MaterialTheme.colorScheme.primary
-                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             },
         )
 
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(12.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = onApply, enabled = dirty || prompt.isBlank()) {
-                Text(if (dirty) "Guardar y aplicar" else "Aplicar")
-            }
-            TextButton(onClick = onReset, enabled = prompt.isNotBlank()) { Text("Vaciar") }
+            Button(
+                onClick = onApply,
+                enabled = dirty || empty,
+                modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+            ) { Text(if (dirty) c.save else c.apply) }
+            OutlinedButton(
+                onClick = onReset,
+                enabled = !empty,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) { Text(c.reset) }
         }
+        Spacer(Modifier.height(6.dp))
         Text(
-            "Aplicar reconstruye la conversación actual con tu hilo y las instrucciones nuevas: el chat no pierde la memoria, el modelo cambia de modales.",
+            c.resetNote,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        Spacer(Modifier.height(12.dp))
+        FilledTonalButton(
+            onClick = onSaveAndStartNewChat,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+        ) { Text(c.saveAndNew) }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            c.saveAndNewNote,
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -958,31 +1116,49 @@ private fun SettingsSheet(
         Spacer(Modifier.height(18.dp))
         HorizontalDivider()
         Spacer(Modifier.height(12.dp))
-        Text("Ejemplos", style = MaterialTheme.typography.labelMedium)
+        Text(c.examplesTitle, style = MaterialTheme.typography.labelMedium)
+        Spacer(Modifier.height(2.dp))
         Text(
-            "Toca uno para ponerlo en el campo y edítalo a tu gusto.",
+            c.examplesNote,
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Spacer(Modifier.height(6.dp))
+        Spacer(Modifier.height(8.dp))
         examples.forEach { example ->
+            // Full-width rows, not chips: a 45-character instruction inside a chip is ellipsised,
+            // and an example only teaches if it can be read whole. Tapping replaces the text.
             Surface(
                 onClick = { onPromptChange(example) },
-                shape = RoundedCornerShape(12.dp),
-                color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.surfaceContainer,
                 modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
             ) {
-                Text(
-                    example,
+                Row(
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                    style = MaterialTheme.typography.bodySmall,
-                )
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        example,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.weight(1f),
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        c.use,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
             }
         }
 
         Spacer(Modifier.height(14.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(12.dp))
         Text(
-            "La voz, el idioma y el manos libres se ajustan en Voice (men\u00fa \u22ee).",
+            c.voiceNote,
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
