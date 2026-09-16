@@ -201,6 +201,29 @@ class VoiceRepository(private val context: Context) {
         return espeakDir
     }
 
+    /**
+     * Repairs an install made by 0.8.x–0.9.1: Kokoro was downloaded into `tts/kokoro-en` while the
+     * app looked for it in the shared `tts/kokoro`, so the files were there and the app still said
+     * "not downloaded". Moving them costs a second; re-downloading costs the user 166 MB.
+     */
+    fun migrateVoiceFolders() {
+        for (strayName in listOf("kokoro-en", "kokoro-es")) {
+            val stray = File(root, "tts/$strayName")
+            if (!stray.isDirectory) continue
+            val target = ttsDir("kokoro")
+            stray.listFiles()?.forEach { file ->
+                val dest = File(target, file.name)
+                if (dest.exists()) {
+                    file.delete()
+                } else if (!file.renameTo(dest)) {
+                    file.copyTo(dest, overwrite = true)
+                    file.delete()
+                }
+            }
+            if (stray.listFiles().isNullOrEmpty()) stray.delete()
+        }
+    }
+
     // --- download --------------------------------------------------------------------------
 
     /**

@@ -169,16 +169,15 @@ fun ChatScreen(vm: ChatViewModel) {
                     }
                 },
                 actions = {
+                    // Voice stays in the open: it is where the models live, and hiding it behind
+                    // the overflow cost the user a hunt for it.
+                    TextButton(onClick = { showVoice = true }) { Text("Voice") }
                     TextButton(onClick = { showSettings = true }) { Text("Ajustes") }
                     Box {
                         IconButton(onClick = { showOverflow = true }) {
                             Icon(Icons.Default.MoreVert, contentDescription = "Más")
                         }
                         DropdownMenu(expanded = showOverflow, onDismissRequest = { showOverflow = false }) {
-                            DropdownMenuItem(
-                                text = { Text("Voice") },
-                                onClick = { showOverflow = false; showVoice = true },
-                            )
                             DropdownMenuItem(
                                 text = { Text("Chats") },
                                 onClick = { showOverflow = false; showChats = true },
@@ -680,7 +679,13 @@ private fun VoiceSheet(
     onHandsFree: (Boolean) -> Unit,
     onVoice: (String) -> Unit,
 ) {
-    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .imePadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp),
+    ) {
         Text("Voice", style = MaterialTheme.typography.titleLarge)
         Spacer(Modifier.height(4.dp))
         Text(
@@ -688,6 +693,37 @@ private fun VoiceSheet(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        Spacer(Modifier.height(12.dp))
+
+        // First thing in the sheet: what is missing and one button that fetches it. Everything else
+        // is a preference; this is the thing that makes voice work at all.
+        val chosen = models.choices.firstOrNull { it.selected }
+        val missing = !models.sttInstalled ||
+            chosen == null ||
+            !chosen.installed ||
+            !models.vadInstalled
+        if (models.downloading) {
+            LinearProgressIndicator(progress = { models.progress }, modifier = Modifier.fillMaxWidth())
+            Text(models.label.ifBlank { "Descargando\u2026" }, style = MaterialTheme.typography.labelSmall)
+        } else {
+            Button(onClick = onDownload, enabled = missing, modifier = Modifier.fillMaxWidth()) {
+                Text(if (missing) "Descargar lo que falta" else "Todo descargado")
+            }
+            if (missing) {
+                val parts = buildList {
+                    if (!models.sttInstalled) add("Whisper, 99 MB (reconocer tu voz)")
+                    if (chosen == null) add("la lista de voces")
+                    else if (!chosen.installed) add("la voz ${chosen.label}, ${chosen.megabytes} MB")
+                    if (!models.vadInstalled) add("el detector de voz, 2 MB")
+                }
+                Text(
+                    "Falta: " + parts.joinToString(" \u00b7 ") + ".",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
         Spacer(Modifier.height(16.dp))
 
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -766,7 +802,7 @@ private fun VoiceSheet(
                     when {
                         choice.selected && choice.installed -> "en uso"
                         choice.installed -> "lista"
-                        else -> "${choice.megabytes} MB"
+                        else -> "Descargar \u00b7 ${choice.megabytes} MB"
                     },
                     style = MaterialTheme.typography.labelSmall,
                     color = if (choice.installed) MaterialTheme.colorScheme.onSurfaceVariant
@@ -803,29 +839,13 @@ private fun VoiceSheet(
             )
         }
 
-        Spacer(Modifier.height(12.dp))
-        if (models.downloading) {
-            LinearProgressIndicator(progress = { models.progress }, modifier = Modifier.fillMaxWidth())
-            Text(models.label.ifBlank { "Downloading\u2026" }, style = MaterialTheme.typography.labelSmall)
-        } else {
-            val chosen = models.choices.firstOrNull { it.selected }
-            val missing = !models.sttInstalled || chosen?.installed == false || !models.vadInstalled
-            Button(onClick = onDownload, enabled = missing) {
-                Text(if (missing) "Descargar lo que falta" else "Voz lista")
-            }
-            if (missing) {
-                val parts = buildList {
-                    if (!models.sttInstalled) add("Whisper (99 MB, los dos idiomas)")
-                    if (chosen?.installed == false) add("la voz ${chosen.label} (${chosen.megabytes} MB)")
-                    if (!models.vadInstalled) add("el detector de voz (2 MB)")
-                }
-                Text(
-                    "Falta: " + parts.joinToString(", ") + ".",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
+        Spacer(Modifier.height(10.dp))
+        Text(
+            "Si la descarga falla: los archivos viven en " +
+                "Android/data/fyi.amago.localchat/files/voice/ y se pueden copiar desde una computadora con adb push.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Spacer(Modifier.height(28.dp))
     }
 }

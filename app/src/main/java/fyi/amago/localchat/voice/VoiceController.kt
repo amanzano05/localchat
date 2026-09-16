@@ -109,6 +109,8 @@ class VoiceController(private val context: Context) {
     }
 
     fun refresh() {
+        // Cheap, idempotent repair for installs from before 0.9.2 — see the repository.
+        runCatching { repo.migrateVoiceFolders() }
         _models.update {
             it.copy(
                 sttInstalled = repo.sttInstalled(),
@@ -357,7 +359,10 @@ class VoiceController(private val context: Context) {
             }
             if (needTts) {
                 withContext(Dispatchers.IO) {
-                    repo.download(voice.files, repo.ttsDir(voice.id)) { done, total, name ->
+                    // voice.dir, not voice.id: two options can share one folder (Kokoro holds one
+                    // model for every language), and writing to the wrong one means the app never
+                    // sees what it just downloaded.
+                    repo.download(voice.files, repo.ttsDir(voice.dir)) { done, total, name ->
                         _models.update {
                             it.copy(
                                 progress = if (total > 0) done.toFloat() / total else 0f,
@@ -381,7 +386,12 @@ class VoiceController(private val context: Context) {
             }
         } catch (t: Throwable) {
             Log.e(TAG, "voice download failed", t)
-            _models.update { it.copy(label = "Download failed: ${t.message ?: "network error"}") }
+            _models.update {
+                it.copy(
+                    label = "Descarga fallida: ${t.message ?: "sin conexión"}",
+                    voiceError = "La descarga de la voz falló: ${t.message ?: "sin conexión"}. Revisa tu conexión y vuelve a intentar.",
+                )
+            }
         } finally {
             _models.update { it.copy(downloading = false, progress = 0f, label = "") }
             refresh()
