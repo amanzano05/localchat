@@ -6,6 +6,9 @@ local.properties
 build/
 app/build/
 *.apk
+
+# Native speech library (50 MB, one file). Fetch it once with tools/fetch-voice-libs.sh
+app/libs/*.aar
 *.jks
 .kotlin/
 *.log

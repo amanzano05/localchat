@@ -12,6 +12,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import fyi.amago.localchat.voice.VoiceController
+import fyi.amago.localchat.voice.VoiceModelsState
+import fyi.amago.localchat.voice.VoiceState
 import java.io.File
 
 data class ChatMessage(
@@ -52,6 +55,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val repo = ModelRepository(app)
     private val store = ChatStore(app)
     private val engine = LlmEngine()
+    private val voice = VoiceController(app)
+
+    /** Microphone/speaker state, kept out of [ChatUiState] so recording never recomposes the chat. */
+    val voiceState: StateFlow<VoiceState> get() = voice.state
+    val voiceModels: StateFlow<VoiceModelsState> get() = voice.models
+    val voiceLang: StateFlow<String> get() = voice.lang
+    val speakReplies: StateFlow<Boolean> get() = voice.speakReplies
 
     private val _state = MutableStateFlow(ChatUiState())
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
@@ -239,6 +249,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val prompt = text.trim()
         val st = _state.value
         if (prompt.isEmpty() || st.generating || st.model !is ModelState.Ready) return
+        voice.stopSpeaking() // talking to it interrupts it, exactly like a person
 
         val now = System.currentTimeMillis()
         val botId = nextId++
@@ -252,8 +263,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         persist()
 
         viewModelScope.launch {
+            var finalText = ""
             try {
                 engine.send(prompt).collect { partial ->
+                    finalText = partial
                     _state.update { s ->
                         s.copy(messages = s.messages.map { if (it.id == botId) it.copy(text = partial) else it })
                     }
@@ -275,6 +288,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 persist()
             }
+            // Speak the answer once it is complete — never mid-stream, or it stutters.
+            if (voice.speakReplies.value && finalText.isNotBlank()) voice.speak(finalText)
         }
     }
 
@@ -282,10 +297,60 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         engine.cancel()
     }
 
+    // ---------------------------------------------------------------- voice
+
+    /** Starts a take. False means the mic or the speech model is not ready — [voiceState] says why. */
+    fun startVoice(): Boolean {
+        voice.stopSpeaking()
+        return voice.startListening()
+    }
+
+    /** Keeps the level meter alive while recording. */
+    fun voiceTick() = voice.tick()
+
+    fun cancelVoice() = voice.cancelListening()
+
+    /**
+     * Ends the take, transcribes on the phone, and sends what it heard. A silent take says so
+     * instead of sending an empty message.
+     */
+    fun finishVoice() {
+        viewModelScope.launch {
+            val heard = voice.finishListening()
+            when {
+                heard.isBlank() -> _state.update { it.copy(notice = "Didn\u2019t catch that \u2014 hold on, tap again and speak") }
+                _state.value.model !is ModelState.Ready -> _state.update { it.copy(notice = "Model not loaded yet") }
+                else -> {
+                    _state.update { it.copy(notice = null) }
+                    send(heard)
+                }
+            }
+        }
+    }
+
+    fun speak(text: String) {
+        viewModelScope.launch { voice.speak(text) }
+    }
+
+    fun stopSpeaking() = voice.stopSpeaking()
+
+    fun setVoiceLang(lang: String) = voice.setLang(lang)
+
+    fun setSpeakReplies(on: Boolean) = voice.setSpeakReplies(on)
+
+    fun downloadVoiceModels() {
+        viewModelScope.launch { voice.downloadMissing() }
+    }
+
+    fun sttDescription(): String = voice.sttDescription()
+
     fun clearNotice() = _state.update { it.copy(notice = null) }
+
+    fun notice(message: String) = _state.update { it.copy(notice = message) }
 
     override fun onCleared() {
         engine.close()
+        voice.close()
         super.onCleared()
     }
 

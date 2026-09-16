@@ -14,8 +14,8 @@ android {
         applicationId = "fyi.amago.localchat"
         minSdk = 28
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.4.0"
+        versionCode = 5
+        versionName = "0.5.0"
         ndk {
             // The litertlm-android AAR ships arm64-v8a + x86_64 only.
             abiFilters += listOf("arm64-v8a")
@@ -80,4 +80,8 @@ dependencies {
     implementation("androidx.compose.material3:material3")
 
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.17.0")
+
+    // Voice, all on-device: Whisper (speech→text) and Piper (text→speech) through sherpa-onnx,
+    // one AAR, Apache-2.0, arm64-v8a. No second speech framework, no network, no keys.
+    implementation(files("libs/sherpa-onnx-1.13.8.aar"))
 }

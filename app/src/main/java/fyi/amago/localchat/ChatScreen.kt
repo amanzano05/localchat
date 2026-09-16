@@ -1,7 +1,12 @@
 package fyi.amago.localchat
 
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -24,6 +29,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -33,6 +39,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -41,6 +48,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.Switch
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -52,26 +60,54 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import fyi.amago.localchat.voice.VoiceModelsState
+import fyi.amago.localchat.voice.VoiceState
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(vm: ChatViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
+    val voice by vm.voiceState.collectAsStateWithLifecycle()
+    val voiceModels by vm.voiceModels.collectAsStateWithLifecycle()
+    val voiceLang by vm.voiceLang.collectAsStateWithLifecycle()
+    val speakReplies by vm.speakReplies.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var input by remember { mutableStateOf("") }
     var showModels by remember { mutableStateOf(false) }
     var showChats by remember { mutableStateOf(false) }
+    var showVoice by remember { mutableStateOf(false) }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) vm.importModel(context, uri)
+    }
+
+    // The mic is asked for at the moment it is wanted, with the reason attached — not on launch.
+    val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) vm.startVoice() else vm.notice("Microphone permission is off, so voice is unavailable")
+    }
+
+    // One ticker for the whole recording: moves the meter and the timer, and stops by itself.
+    LaunchedEffect(voice) {
+        while (voice is VoiceState.Listening) {
+            vm.voiceTick()
+            delay(120)
+        }
     }
 
     val listState = rememberLazyListState()
@@ -116,6 +152,7 @@ fun ChatScreen(vm: ChatViewModel) {
                     }
                 },
                 actions = {
+                    TextButton(onClick = { showVoice = true }) { Text("Voice") }
                     TextButton(onClick = { showChats = true }) { Text("Chats") }
                     TextButton(onClick = { showModels = !showModels }) { Text("Model") }
                 },
@@ -173,6 +210,12 @@ fun ChatScreen(vm: ChatViewModel) {
                 }
             }
 
+            VoiceStrip(
+                voice = voice,
+                onCancel = { vm.cancelVoice() },
+                onStopSpeaking = { vm.stopSpeaking() },
+            )
+
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -193,6 +236,19 @@ fun ChatScreen(vm: ChatViewModel) {
                     maxLines = 5,
                     shape = RoundedCornerShape(24.dp),
                 )
+                MicButton(
+                    voice = voice,
+                    voiceReady = voiceModels.ready,
+                    onTap = {
+                        when {
+                            voice is VoiceState.Listening -> vm.finishVoice()
+                            voice is VoiceState.Transcribing -> Unit
+                            !voiceModels.ready -> showVoice = true
+                            hasMic(context) -> if (!vm.startVoice()) showVoice = true
+                            else -> micPermission.launch(Manifest.permission.RECORD_AUDIO)
+                        }
+                    },
+                )
                 if (state.generating) {
                     OutlinedButton(onClick = { vm.stopGenerating() }) { Text("Stop") }
                 } else {
@@ -201,6 +257,20 @@ fun ChatScreen(vm: ChatViewModel) {
                     }
                 }
             }
+        }
+    }
+
+    if (showVoice) {
+        ModalBottomSheet(onDismissRequest = { showVoice = false }) {
+            VoiceSheet(
+                models = voiceModels,
+                lang = voiceLang,
+                speak = speakReplies,
+                sttName = vm.sttDescription(),
+                onLang = { vm.setVoiceLang(it) },
+                onSpeak = { vm.setSpeakReplies(it) },
+                onDownload = { vm.downloadVoiceModels() },
+            )
         }
     }
 
@@ -385,3 +455,225 @@ private fun whenLabel(ms: Long): String {
 private fun mb(bytes: Long): String = if (bytes <= 0) "0 MB" else String.format("%.1f MB", bytes / 1048576.0)
 
 private fun pct(read: Long, total: Long): String = if (total <= 0) "" else "${(read * 100 / total)}%"
+
+
+// ---------------------------------------------------------------------------- voice
+
+/** The status half of voice: what the mic is doing, and the way out of it. */
+@Composable
+private fun VoiceStrip(voice: VoiceState, onCancel: () -> Unit, onStopSpeaking: () -> Unit) {
+    when (voice) {
+        VoiceState.Idle -> Unit
+
+        is VoiceState.Listening -> Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            LevelMeter(voice.level)
+            Text(
+                "Listening \u00b7 ${"%.1f".format(voice.seconds)}s",
+                style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = onCancel) { Text("Cancel") }
+        }
+
+        VoiceState.Transcribing -> Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+            Text("Transcribing on the phone\u2026", style = MaterialTheme.typography.labelMedium)
+        }
+
+        is VoiceState.Speaking -> Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text("Speaking", style = MaterialTheme.typography.labelMedium, modifier = Modifier.weight(1f))
+            TextButton(onClick = onStopSpeaking) { Text("Stop") }
+        }
+
+        is VoiceState.Failed -> Text(
+            voice.message,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.error,
+        )
+    }
+}
+
+/** Eight bars that answer one question: is it hearing me? */
+@Composable
+private fun LevelMeter(level: Float) {
+    val bars = 8
+    val on = 0.15f + level.coerceIn(0f, 1f) * 1.6f
+    Canvas(modifier = Modifier.size(width = 34.dp, height = 16.dp)) {
+        val gap = 2.dp.toPx()
+        val w = (size.width - gap * (bars - 1)) / bars
+        for (i in 0 until bars) {
+            val t = (i + 1f) / bars
+            val lit = on >= t
+            val h = size.height * (0.35f + 0.65f * t)
+            drawRoundRect(
+                color = if (lit) Color(0xFF9CC7FF) else Color(0xFF3A3F46),
+                topLeft = Offset(i * (w + gap), size.height - h),
+                size = Size(w, h),
+                cornerRadius = CornerRadius(w / 2f, w / 2f),
+            )
+        }
+    }
+}
+
+/**
+ * The microphone. Drawn by hand on purpose: Compose's core icon set has no mic, and pulling in the
+ * extended icon pack for one glyph is not worth 1.5 MB of APK.
+ */
+@Composable
+private fun MicButton(voice: VoiceState, voiceReady: Boolean, onTap: () -> Unit) {
+    val listening = voice is VoiceState.Listening
+    val speaking = voice is VoiceState.Speaking
+    val busy = voice is VoiceState.Transcribing
+    val bg = when {
+        listening -> MaterialTheme.colorScheme.errorContainer
+        speaking -> MaterialTheme.colorScheme.tertiaryContainer
+        else -> MaterialTheme.colorScheme.secondaryContainer
+    }
+    val tint = when {
+        listening -> MaterialTheme.colorScheme.onErrorContainer
+        speaking -> MaterialTheme.colorScheme.onTertiaryContainer
+        else -> MaterialTheme.colorScheme.onSecondaryContainer
+    }
+    IconButton(
+        onClick = onTap,
+        enabled = !busy,
+        modifier = Modifier.size(48.dp).background(bg, CircleShape),
+    ) {
+        MicGlyph(tint = if (voiceReady || listening) tint else tint.copy(alpha = 0.45f), filled = listening)
+    }
+}
+
+@Composable
+private fun MicGlyph(tint: Color, filled: Boolean, size: androidx.compose.ui.unit.Dp = 22.dp) {
+    Canvas(modifier = Modifier.size(size)) {
+        val w = this.size.width
+        val h = this.size.height
+        val stroke = w * 0.09f
+        val bodyW = w * 0.34f
+        val bodyH = h * 0.46f
+        val bodyTop = h * 0.06f
+        val style = if (filled) androidx.compose.ui.graphics.drawscope.Fill
+        else Stroke(width = stroke, cap = StrokeCap.Round)
+        drawRoundRect(
+            color = tint,
+            topLeft = Offset((w - bodyW) / 2f, bodyTop),
+            size = Size(bodyW, bodyH),
+            cornerRadius = CornerRadius(bodyW / 2f, bodyW / 2f),
+            style = style,
+        )
+        drawArc(
+            color = tint,
+            startAngle = 0f,
+            sweepAngle = 180f,
+            useCenter = false,
+            topLeft = Offset(w * 0.18f, bodyTop + bodyH * 0.30f),
+            size = Size(w * 0.64f, h * 0.46f),
+            style = Stroke(width = stroke, cap = StrokeCap.Round),
+        )
+        drawLine(
+            color = tint,
+            start = Offset(w / 2f, h * 0.80f),
+            end = Offset(w / 2f, h * 0.94f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+    }
+}
+
+/** Voice settings, reachable without a model loaded: the models are a voice, not a chat, concern. */
+@Composable
+private fun VoiceSheet(
+    models: VoiceModelsState,
+    lang: String,
+    speak: Boolean,
+    sttName: String,
+    onLang: (String) -> Unit,
+    onSpeak: (Boolean) -> Unit,
+    onDownload: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
+        Text("Voice", style = MaterialTheme.typography.titleLarge)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Whisper listens, Piper speaks, both on this phone. Airplane mode is fine.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(16.dp))
+
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Language of the conversation", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+            TextButton(onClick = { onLang("en") }, enabled = lang != "en") { Text(if (lang == "en") "English \u2713" else "English") }
+            TextButton(onClick = { onLang("es") }, enabled = lang != "es") { Text(if (lang == "es") "Espa\u00f1ol \u2713" else "Espa\u00f1ol") }
+        }
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Speak replies", style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    "Reads each answer out loud when it finishes.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(checked = speak, onCheckedChange = onSpeak)
+        }
+
+        Spacer(Modifier.height(12.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(12.dp))
+
+        StatusLine("Speech to text", sttName)
+        StatusLine("Voice", voiceLabel(models, lang))
+        StatusLine("Storage", "about 160 MB once everything is in")
+
+        Spacer(Modifier.height(12.dp))
+        if (models.downloading) {
+            LinearProgressIndicator(progress = { models.progress }, modifier = Modifier.fillMaxWidth())
+            Text(models.label.ifBlank { "Downloading\u2026" }, style = MaterialTheme.typography.labelSmall)
+        } else {
+            val missing = !models.sttInstalled || !(if (lang == "es") models.ttsEsInstalled else models.ttsEnInstalled)
+            Button(onClick = onDownload, enabled = missing) {
+                Text(if (missing) "Download voice models" else "Voice is ready")
+            }
+            if (missing) {
+                Text(
+                    "Whisper tiny (99 MB, both languages) plus the " + (if (lang == "es") "Spanish" else "English") + " voice.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Spacer(Modifier.height(28.dp))
+    }
+}
+
+@Composable
+private fun StatusLine(label: String, value: String) {
+    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+        Text(label, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+        Text(value, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+private fun voiceLabel(models: VoiceModelsState, lang: String): String {
+    val installed = if (lang == "es") models.ttsEsInstalled else models.ttsEnInstalled
+    val name = if (lang == "es") "es_ES sharvard" else "en_US amy"
+    return if (installed) "$name \u00b7 installed" else "$name \u00b7 not installed"
+}
+
+private fun hasMic(context: Context): Boolean =
+    ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
