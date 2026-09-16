@@ -51,14 +51,14 @@ class TtsService : Service() {
             MSG_SPEAK -> {
                 val data = msg.data
                 val text = data.getString(KEY_TEXT).orEmpty()
-                val lang = data.getString(KEY_LANG) ?: "en"
+                val voice = data.getString(KEY_VOICE) ?: "en"
                 val espeak = data.getString(KEY_ESPEAK).orEmpty()
                 val speed = data.getFloat(KEY_SPEED, 1.0f)
                 val id = data.getInt(KEY_ID, 0)
                 worker.execute {
                     sendState(reply, STATE_SPEAKING, id)
                     val ok = runCatching {
-                        engine.speak(text, lang, espeak, speed)
+                        engine.speak(text, voice, espeak, speed)
                         engine.lastError == null
                     }.getOrElse {
                         engine.log("SERVICE SPEAK THREW: ${it.javaClass.simpleName}: ${it.message}")
@@ -72,10 +72,10 @@ class TtsService : Service() {
             MSG_STOP -> engine.stop()
 
             MSG_TEST -> {
-                val lang = msg.data.getString(KEY_LANG) ?: "en"
+                val voice = msg.data.getString(KEY_VOICE) ?: "en"
                 val id = msg.data.getInt(KEY_ID, 0)
                 worker.execute {
-                    val report = runCatching { selfTest(lang) }
+                    val report = runCatching { selfTest(voice) }
                         .getOrElse { "test threw: ${it.javaClass.simpleName}: ${it.message}" }
                     sendDone(reply, id, true, report)
                 }
@@ -90,7 +90,7 @@ class TtsService : Service() {
     }
 
     /** Files → engine → speech, reported in plain sentences for the Voice sheet. */
-    private fun selfTest(lang: String): String {
+    private fun selfTest(voiceId: String): String {
         val report = StringBuilder()
         report.append("speech to text: ").append(repo.installedStt()?.label ?: "missing").append('\n')
         val espeak = runCatching { repo.ensureEspeakData(assets) }.getOrNull()
@@ -101,19 +101,19 @@ class TtsService : Service() {
             val core = listOf("phontab", "phondata", "phonindex", "intonations").all { File(espeak, it).isFile }
             report.append("phoneme data: ").append(count).append(" files, core complete=").append(core).append('\n')
         }
-        val installed = repo.ttsInstalled(lang)
-        if (!installed) {
-            report.append("voice (").append(lang).append("): missing\n")
+        val option = repo.voice(voiceId)
+        if (option == null || !repo.voiceInstalled(option)) {
+            report.append("voz (").append(voiceId).append("): sin descargar\n")
             return report.toString()
         }
-        report.append("voice (").append(lang).append("): ")
-            .append(repo.ttsModelFile(lang).length() / 1_048_576).append(" MB\n")
+        report.append("voz: ").append(option.label).append(" · ")
+            .append(repo.voiceModelFile(option).length() / 1_048_576).append(" MB\n")
         if (espeak != null) {
-            val loaded = engine.load(lang, espeak.absolutePath)
+            val loaded = engine.load(voiceId, espeak.absolutePath)
             report.append("engine: ").append(if (loaded) "loaded" else "FAILED — " + (engine.lastError ?: "unknown")).append('\n')
             if (loaded) {
                 val started = System.currentTimeMillis()
-                engine.speak("Voice test, one two three.", lang, espeak.absolutePath)
+                engine.speak("Voice test, one two three.", voiceId, espeak.absolutePath)
                 val ms = System.currentTimeMillis() - started
                 report.append("synthesis: ").append(if (engine.lastError == null) "ok in $ms ms" else "FAILED — ${engine.lastError}").append('\n')
             }
@@ -168,7 +168,7 @@ class TtsService : Service() {
         const val STATE_SPEAKING = 1
 
         const val KEY_TEXT = "text"
-        const val KEY_LANG = "lang"
+        const val KEY_VOICE = "voice"
         const val KEY_ESPEAK = "espeak"
         const val KEY_SPEED = "speed"
         const val KEY_ID = "id"

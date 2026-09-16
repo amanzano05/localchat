@@ -45,6 +45,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -88,6 +89,7 @@ fun ChatScreen(vm: ChatViewModel) {
     val voiceModels by vm.voiceModels.collectAsStateWithLifecycle()
     val voiceLang by vm.voiceLang.collectAsStateWithLifecycle()
     val speakReplies by vm.speakReplies.collectAsStateWithLifecycle()
+    val handsFree by vm.handsFree.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var input by remember { mutableStateOf("") }
     var showModels by remember { mutableStateOf(false) }
@@ -283,6 +285,9 @@ fun ChatScreen(vm: ChatViewModel) {
                 onSpeak = { vm.setSpeakReplies(it) },
                 onDownload = { vm.downloadVoiceModels() },
                 onTest = { vm.runVoiceCheck() },
+                handsFree = handsFree,
+                onHandsFree = { vm.setHandsFree(it) },
+                onVoice = { vm.setVoice(it) },
             )
         }
     }
@@ -617,6 +622,9 @@ private fun VoiceSheet(
     onSpeak: (Boolean) -> Unit,
     onDownload: () -> Unit,
     onTest: () -> Unit,
+    handsFree: Boolean,
+    onHandsFree: (Boolean) -> Unit,
+    onVoice: (String) -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
         Text("Voice", style = MaterialTheme.typography.titleLarge)
@@ -646,13 +654,72 @@ private fun VoiceSheet(
             Switch(checked = speak, onCheckedChange = onSpeak)
         }
 
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Manos libres", style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    if (!models.vadInstalled)
+                        "Falta el detector de voz (2 MB) — toca Descargar abajo."
+                    else
+                        "El micrófono se abre solo y el silencio cierra el turno.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = handsFree,
+                onCheckedChange = onHandsFree,
+                enabled = models.handsFreeReady,
+            )
+        }
+
         Spacer(Modifier.height(12.dp))
         HorizontalDivider()
         Spacer(Modifier.height(12.dp))
 
         StatusLine("Speech to text", sttName)
-        StatusLine("Voice", voiceLabel(models, lang))
-        StatusLine("Storage", "about 160 MB once everything is in")
+
+        Spacer(Modifier.height(10.dp))
+        Text("Voz", style = MaterialTheme.typography.labelMedium)
+        Text(
+            if (lang == "es") "Elige cómo quieres que te hable." else "Pick how it should sound.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(4.dp))
+        models.choices.forEach { choice ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(enabled = !models.downloading) { onVoice(choice.id) }
+                    .padding(vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RadioButton(
+                    selected = choice.selected,
+                    onClick = { onVoice(choice.id) },
+                    enabled = !models.downloading,
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(choice.label, style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        choice.note,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Text(
+                    when {
+                        choice.selected && choice.installed -> "en uso"
+                        choice.installed -> "lista"
+                        else -> "${choice.megabytes} MB"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (choice.installed) MaterialTheme.colorScheme.onSurfaceVariant
+                    else MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
 
         Spacer(Modifier.height(12.dp))
         OutlinedButton(
@@ -687,13 +754,19 @@ private fun VoiceSheet(
             LinearProgressIndicator(progress = { models.progress }, modifier = Modifier.fillMaxWidth())
             Text(models.label.ifBlank { "Downloading\u2026" }, style = MaterialTheme.typography.labelSmall)
         } else {
-            val missing = !models.sttInstalled || !(if (lang == "es") models.ttsEsInstalled else models.ttsEnInstalled)
+            val chosen = models.choices.firstOrNull { it.selected }
+            val missing = !models.sttInstalled || chosen?.installed == false || !models.vadInstalled
             Button(onClick = onDownload, enabled = missing) {
-                Text(if (missing) "Download voice models" else "Voice is ready")
+                Text(if (missing) "Descargar lo que falta" else "Voz lista")
             }
             if (missing) {
+                val parts = buildList {
+                    if (!models.sttInstalled) add("Whisper (99 MB, los dos idiomas)")
+                    if (chosen?.installed == false) add("la voz ${chosen.label} (${chosen.megabytes} MB)")
+                    if (!models.vadInstalled) add("el detector de voz (2 MB)")
+                }
                 Text(
-                    "Whisper tiny (99 MB, both languages) plus the " + (if (lang == "es") "Spanish" else "English") + " voice.",
+                    "Falta: " + parts.joinToString(", ") + ".",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

@@ -6,6 +6,9 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -62,10 +65,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     val voiceModels: StateFlow<VoiceModelsState> get() = voice.models
     val voiceLang: StateFlow<String> get() = voice.lang
     val speakReplies: StateFlow<Boolean> get() = voice.speakReplies
+    val handsFree: StateFlow<Boolean> get() = voice.handsFree
 
     private val _state = MutableStateFlow(ChatUiState())
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
 
+    private var handsFreeJob: Job? = null
+    private val SETTLE_MS = 600L
     private val conversations = mutableListOf<ChatStore.StoredConversation>()
     private var currentId: String? = null
     private var nextId = 0L
@@ -346,6 +352,57 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setSpeakReplies(on: Boolean) = voice.setSpeakReplies(on)
 
+    /** Picks which voice speaks the current language. */
+    fun setVoice(id: String) {
+        voice.setVoice(id)
+        // A voice that is not on the phone yet is worth fetching right away: that is what picking it means.
+        if (!(voice.models.value.choices.firstOrNull { it.id == id }?.installed ?: false)) downloadVoiceModels()
+    }
+
+    /**
+     * Hands-free conversation: while it is on, the microphone opens itself, silence closes the turn,
+     * and whatever was said becomes a message. The loop waits whenever the app is busy — generating
+     * or speaking — so the phone never listens to its own voice.
+     */
+    fun setHandsFree(on: Boolean) {
+        voice.setHandsFree(on)
+        handsFreeJob?.cancel()
+        handsFreeJob = null
+        if (!on) return
+        handsFreeJob = viewModelScope.launch {
+            var quietSince = 0L
+            while (isActive && voice.handsFree.value) {
+                val busy = _state.value.generating ||
+                    voice.isSpeaking() ||
+                    voice.state.value is VoiceState.Speaking ||
+                    voice.state.value is VoiceState.Listening ||
+                    voice.state.value is VoiceState.Transcribing
+                if (busy) {
+                    quietSince = 0L
+                    delay(250)
+                    continue
+                }
+                // A short quiet moment before opening the mic: without it the first syllable of
+                // the answer would be heard as the next question and the phone would talk to itself.
+                if (quietSince == 0L) {
+                    quietSince = System.currentTimeMillis()
+                    delay(200)
+                    continue
+                }
+                if (System.currentTimeMillis() - quietSince < SETTLE_MS) {
+                    delay(150)
+                    continue
+                }
+                val heard = voice.listenOnce()
+                quietSince = 0L
+                if (!heard.isNullOrBlank()) {
+                    _state.update { it.copy(notice = null) }
+                    send(heard)
+                }
+            }
+        }
+    }
+
     fun downloadVoiceModels() {
         viewModelScope.launch { voice.downloadMissing() }
     }
@@ -368,6 +425,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun notice(message: String) = _state.update { it.copy(notice = message) }
 
     override fun onCleared() {
+        handsFreeJob?.cancel()
         engine.close()
         voice.close()
         super.onCleared()

@@ -19,11 +19,25 @@ sealed interface VoiceState {
     data class Failed(val message: String) : VoiceState
 }
 
+/** One selectable voice, as the sheet needs to draw it. */
+data class VoiceChoice(
+    val id: String,
+    val label: String,
+    val note: String,
+    val megabytes: Int,
+    val installed: Boolean,
+    val selected: Boolean,
+)
+
 /** Voice models: what is on the phone and how far a download has got. */
 data class VoiceModelsState(
     val sttInstalled: Boolean = false,
     val ttsEnInstalled: Boolean = false,
     val ttsEsInstalled: Boolean = false,
+    /** The voices available for the current language, with what is installed and what is in use. */
+    val choices: List<VoiceChoice> = emptyList(),
+    val vadInstalled: Boolean = false,
+    val handsFree: Boolean = false,
     val downloading: Boolean = false,
     val progress: Float = 0f,
     val label: String = "",
@@ -36,6 +50,9 @@ data class VoiceModelsState(
 ) {
     /** Voice is usable once speech recognition and at least one voice are present. */
     val ready: Boolean get() = sttInstalled && (ttsEnInstalled || ttsEsInstalled)
+
+    /** Hands-free needs everything voice needs, plus the detector. */
+    val handsFreeReady: Boolean get() = ready && vadInstalled
 }
 
 /**
@@ -51,6 +68,7 @@ class VoiceController(private val context: Context) {
     private val repo = VoiceRepository(context)
     private val recorder = VoiceRecorder()
     private val stt = SttEngine(repo)
+    private val listener = VadListener(repo)
     private val ttsClient = TtsClient(context)
     private val prefs = context.getSharedPreferences("voice", Context.MODE_PRIVATE)
 
@@ -67,6 +85,13 @@ class VoiceController(private val context: Context) {
     /** Read every answer out loud. Off by default: the first turn should not surprise anyone. */
     private val _speakReplies = MutableStateFlow(prefs.getBoolean(KEY_SPEAK, false))
     val speakReplies: StateFlow<Boolean> = _speakReplies.asStateFlow()
+
+    /**
+     * Hands-free: the microphone opens by itself and silence closes the turn, so the phone behaves
+     * like a conversation instead of a walkie-talkie.
+     */
+    private val _handsFree = MutableStateFlow(prefs.getBoolean(KEY_HANDS_FREE, false))
+    val handsFree: StateFlow<Boolean> = _handsFree.asStateFlow()
 
     init {
         // If the marker from a previous attempt is still set, that attempt never returned: the
@@ -87,10 +112,27 @@ class VoiceController(private val context: Context) {
         _models.update {
             it.copy(
                 sttInstalled = repo.sttInstalled(),
-                ttsEnInstalled = repo.ttsInstalled("en"),
-                ttsEsInstalled = repo.ttsInstalled("es"),
+                ttsEnInstalled = repo.anyVoiceInstalled("en"),
+                ttsEsInstalled = repo.anyVoiceInstalled("es"),
+                choices = choices(),
+                vadInstalled = repo.vadInstalled(),
+                handsFree = _handsFree.value,
                 voiceLog = logTail(8),
                 voiceError = ttsClient.lastError,
+            )
+        }
+    }
+
+    private fun choices(): List<VoiceChoice> {
+        val selected = voiceId(_lang.value)
+        return repo.voicesFor(_lang.value).map { option ->
+            VoiceChoice(
+                id = option.id,
+                label = option.label,
+                note = option.note,
+                megabytes = option.megabytes,
+                installed = repo.voiceInstalled(option),
+                selected = option.id == selected,
             )
         }
     }
@@ -100,6 +142,55 @@ class VoiceController(private val context: Context) {
         prefs.edit().putString(KEY_LANG, _lang.value).apply()
         // A different language is a different voice; the speech process reloads it on demand.
         ttsClient.stop()
+        refresh()
+    }
+
+    /** Which voice speaks for [lang]: the one that was picked, or the language default. */
+    fun voiceId(lang: String): String {
+        val stored = prefs.getString(KEY_VOICE_PREFIX + lang, null)
+        val option = stored?.let { repo.voice(it) }
+        return if (option != null && option.lang == lang) option.id else repo.defaultVoice(lang).id
+    }
+
+    fun selectedVoice(): VoiceRepository.VoiceOption =
+        repo.voice(voiceId(_lang.value)) ?: repo.defaultVoice(_lang.value)
+
+    /** Picks a voice. If it is not on the phone yet, the sheet downloads it. */
+    fun setVoice(id: String) {
+        val option = repo.voice(id) ?: return
+        prefs.edit().putString(KEY_VOICE_PREFIX + option.lang, option.id).apply()
+        ttsClient.stop()
+        log("voice selected: ${option.id}")
+        refresh()
+    }
+
+    fun setHandsFree(on: Boolean) {
+        _handsFree.value = on
+        prefs.edit().putBoolean(KEY_HANDS_FREE, on).apply()
+        if (!on) listener.cancel()
+        log("hands-free " + if (on) "on" else "off")
+        refresh()
+    }
+
+    /**
+     * One hands-free turn: waits for the person to speak and stop, transcribes on the phone, and
+     * returns what was said — or null when nothing happened. Blocking, so callers run it off the
+     * main thread.
+     */
+    suspend fun listenOnce(): String? {
+        if (!repo.vadInstalled() || !repo.sttInstalled()) return null
+        _state.value = VoiceState.Listening(0f, 0f)
+        val samples = withContext(Dispatchers.IO) {
+            listener.listenForOneUtterance { !_handsFree.value }
+        }
+        if (samples == null) {
+            _state.value = VoiceState.Idle
+            return null
+        }
+        _state.value = VoiceState.Transcribing
+        val text = withContext(Dispatchers.IO) { if (stt.load()) stt.transcribe(samples) else "" }
+        _state.value = VoiceState.Idle
+        return text.ifBlank { null }
     }
 
     fun setSpeakReplies(on: Boolean) {
@@ -113,6 +204,7 @@ class VoiceController(private val context: Context) {
     /** Starts capturing. Returns false (and sets [VoiceState.Failed]) if capture cannot start. */
     fun startListening(): Boolean {
         ttsClient.stop() // barge-in: talking over the assistant is how you interrupt it
+        listener.cancel() // and the hands-free listener must let go of the microphone
         if (!repo.sttInstalled()) {
             _state.value = VoiceState.Failed("Speech model not downloaded yet")
             return false
@@ -183,9 +275,10 @@ class VoiceController(private val context: Context) {
             return
         }
         _state.value = VoiceState.Speaking(System.currentTimeMillis())
-        log("asking the voice process to speak ${clean.length} chars")
+        val voice = selectedVoice()
+        log("asking the voice process to speak ${clean.length} chars with ${voice.id}")
         prefs.edit().putBoolean(KEY_INFLIGHT, true).apply()
-        val ok = ttsClient.speak(clean, _lang.value, espeak)
+        val ok = ttsClient.speak(clean, voice.id, espeak)
         prefs.edit().putBoolean(KEY_INFLIGHT, false).apply()
         if (ok) {
             _state.value = VoiceState.Idle
@@ -213,7 +306,7 @@ class VoiceController(private val context: Context) {
      * speech process* and reported in plain sentences.
      */
     suspend fun runVoiceCheck(): String {
-        val report = ttsClient.testVoice(_lang.value)
+        val report = ttsClient.testVoice(selectedVoice().id)
         _models.update { it.copy(lastCheck = report, voiceError = ttsClient.lastError, voiceLog = logTail(8)) }
         return report
     }
@@ -241,9 +334,11 @@ class VoiceController(private val context: Context) {
      */
     suspend fun downloadMissing() {
         if (_models.value.downloading) return
+        val voice = selectedVoice()
         val needStt = !repo.sttInstalled()
-        val needTts = !repo.ttsInstalled(_lang.value)
-        if (!needStt && !needTts) return
+        val needTts = !repo.voiceInstalled(voice)
+        val needVad = !repo.vadInstalled()
+        if (!needStt && !needTts && !needVad) return
 
         _models.update { it.copy(downloading = true, progress = 0f, label = "Starting…") }
         try {
@@ -261,14 +356,24 @@ class VoiceController(private val context: Context) {
                 }
             }
             if (needTts) {
-                val lang = _lang.value
-                val files = repo.ttsFiles(lang)
                 withContext(Dispatchers.IO) {
-                    repo.download(files, repo.ttsDir(lang)) { done, total, name ->
+                    repo.download(voice.files, repo.ttsDir(voice.id)) { done, total, name ->
                         _models.update {
                             it.copy(
                                 progress = if (total > 0) done.toFloat() / total else 0f,
-                                label = (if (lang == "es") "Voz · " else "Voice · ") + "$name · ${mb(done)}",
+                                label = "Voz · $name · ${mb(done)}",
+                            )
+                        }
+                    }
+                }
+            }
+            if (needVad) {
+                withContext(Dispatchers.IO) {
+                    repo.download(listOf(repo.vadFile), repo.vadDir) { done, total, name ->
+                        _models.update {
+                            it.copy(
+                                progress = if (total > 0) done.toFloat() / total else 0f,
+                                label = "Detector de voz · ${mb(done)}",
                             )
                         }
                     }
@@ -301,6 +406,8 @@ class VoiceController(private val context: Context) {
     companion object {
         private const val TAG = "VoiceController"
         private const val KEY_LANG = "lang"
+        private const val KEY_VOICE_PREFIX = "voice_"
+        private const val KEY_HANDS_FREE = "hands_free"
         private const val KEY_SPEAK = "speak_replies"
         private const val KEY_INFLIGHT = "speech_inflight"
         private const val MIN_SECONDS = 0.25f

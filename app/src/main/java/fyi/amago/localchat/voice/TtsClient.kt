@@ -120,7 +120,7 @@ class TtsClient(private val context: Context) {
      * Asks the speech process to say [text] and suspends until it has finished, or until the
      * process dies — whichever comes first. Returns false with [lastError] set on any failure.
      */
-    suspend fun speak(text: String, lang: String, espeakDir: String, speed: Float = 1.0f): Boolean {
+    suspend fun speak(text: String, voiceId: String, espeakDir: String, speed: Float = 1.0f): Boolean {
         if (!ensureConnected()) return false
         val target = messenger ?: return false
         val id = nextId++
@@ -132,7 +132,7 @@ class TtsClient(private val context: Context) {
                     data = Bundle().apply {
                         putInt(TtsService.KEY_ID, id)
                         putString(TtsService.KEY_TEXT, text)
-                        putString(TtsService.KEY_LANG, lang)
+                        putString(TtsService.KEY_VOICE, voiceId)
                         putString(TtsService.KEY_ESPEAK, espeakDir)
                         putFloat(TtsService.KEY_SPEED, speed)
                     }
@@ -159,7 +159,7 @@ class TtsClient(private val context: Context) {
     }
 
     /** Runs the service's self-test and returns its report. Never throws. */
-    suspend fun testVoice(lang: String): String {
+    suspend fun testVoice(voiceId: String): String {
         if (!ensureConnected()) return lastError ?: "voice engine unavailable"
         val target = messenger ?: return "voice engine unavailable"
         val id = nextId++
@@ -170,7 +170,7 @@ class TtsClient(private val context: Context) {
                 Message.obtain(null, TtsService.MSG_TEST).apply {
                     data = Bundle().apply {
                         putInt(TtsService.KEY_ID, id)
-                        putString(TtsService.KEY_LANG, lang)
+                        putString(TtsService.KEY_VOICE, voiceId)
                     }
                     replyTo = replies
                 }

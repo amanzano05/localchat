@@ -10,28 +10,57 @@ import java.net.URL
 /**
  * What has to be on the phone for voice, where it comes from, and how it gets there.
  *
- * Everything is Apache-2.0 / MIT (sherpa-onnx, Whisper, Piper/VITS, espeak-ng) and everything is a
- * *plain file* download — no archives to unpack, so the app needs no decompression code and no new
- * dependency beyond the sherpa-onnx AAR itself.
+ * Everything is Apache-2.0 / MIT (sherpa-onnx, Whisper, Piper/VITS, Silero VAD, espeak-ng) and
+ * everything is a *plain file* download — no archives to unpack, so the app needs no decompression
+ * code and no new dependency beyond the sherpa-onnx AAR itself.
  *
  * Layout, under the app's external files dir so `adb push` works too:
  *
  * ```
  * voice/
  *   stt/  tiny-encoder.int8.onnx  tiny-decoder.int8.onnx  tiny-tokens.txt
- *   tts/en/  en_US-amy-low.onnx  tokens.txt
- *   tts/es/  es_ES-sharvard-medium.onnx  tokens.txt
- *   espeak-ng-data/            (copied out of assets on first use)
+ *   tts/<voiceId>/  <model>.onnx  tokens.txt        one folder per voice you can pick
+ *   vad/  silero_vad.onnx
+ *   espeak-ng-data/                                  (copied out of assets on first use)
  * ```
  */
 class VoiceRepository(private val context: Context) {
 
     val root: File get() = File(context.getExternalFilesDir(null), "voice").apply { mkdirs() }
     val sttDir: File get() = File(root, "stt").apply { mkdirs() }
-    fun ttsDir(lang: String): File = File(root, "tts/$lang").apply { mkdirs() }
+    val vadDir: File get() = File(root, "vad").apply { mkdirs() }
+    fun ttsDir(voiceId: String): File = File(root, "tts/$voiceId").apply { mkdirs() }
     val espeakDir: File get() = File(root, "espeak-ng-data")
 
     // --- catalog ---------------------------------------------------------------------------
+
+    data class RemoteFile(val name: String, val url: String)
+
+    interface ModelSet {
+        val id: String
+        val label: String
+        val files: List<RemoteFile>
+    }
+
+    /**
+     * A voice you can pick. `id` doubles as the folder name under `tts/`; the first two ids are the
+     * historical "en" and "es" folders, so an existing install keeps working without a re-download.
+     */
+    data class VoiceOption(
+        val id: String,
+        val lang: String,
+        val label: String,
+        val note: String,
+        val modelFile: String,
+        val urlBase: String,
+        val megabytes: Int,
+    ) {
+        val files: List<RemoteFile>
+            get() = listOf(
+                RemoteFile(modelFile, "$urlBase/$modelFile"),
+                RemoteFile("tokens.txt", "$urlBase/tokens.txt"),
+            )
+    }
 
     /** Multilingual Whisper tiny, int8: ~99 MB and good enough to know what you said. */
     object WhisperTiny : ModelSet {
@@ -61,37 +90,37 @@ class VoiceRepository(private val context: Context) {
         )
     }
 
-    /** Piper voices, one per language. Apache-2.0 models, MIT tooling. */
-    object VoiceEn : ModelSet {
-        override val id = "tts-en"
-        override val label = "English voice (60 MB)"
-        override val files = listOf(
-            RemoteFile("en_US-amy-low.onnx",
-                "https://huggingface.co/csukuangfj/vits-piper-en_US-amy-low/resolve/main/en_US-amy-low.onnx"),
-            RemoteFile("tokens.txt",
-                "https://huggingface.co/csukuangfj/vits-piper-en_US-amy-low/resolve/main/tokens.txt"),
-        )
-    }
+    private val hf = "https://huggingface.co/csukuangfj/"
 
-    object VoiceEs : ModelSet {
-        override val id = "tts-es"
-        override val label = "Voz en español (73 MB)"
-        override val files = listOf(
-            RemoteFile("es_ES-sharvard-medium.onnx",
-                "https://huggingface.co/csukuangfj/vits-piper-es_ES-sharvard-medium/resolve/main/es_ES-sharvard-medium.onnx"),
-            RemoteFile("tokens.txt",
-                "https://huggingface.co/csukuangfj/vits-piper-es_ES-sharvard-medium/resolve/main/tokens.txt"),
-        )
-    }
+    /**
+     * Piper voices. Tiers are named for quality, not size: `low` is the fastest and thinnest,
+     * `medium` is clear, `high` is the most natural and the biggest.
+     */
+    val voices: List<VoiceOption> = listOf(
+        VoiceOption("en", "en", "Amy · rápida", "la de siempre, la más liviana",
+            "en_US-amy-low.onnx", hf + "vits-piper-en_US-amy-low/resolve/main", 60),
+        VoiceOption("en-amy-med", "en", "Amy · media", "más clara, mismo peso",
+            "en_US-amy-medium.onnx", hf + "vits-piper-en_US-amy-medium/resolve/main", 64),
+        VoiceOption("en-lessac-hi", "en", "Lessac · alta", "la más natural en inglés",
+            "en_US-lessac-high.onnx", hf + "vits-piper-en_US-lessac-high/resolve/main", 110),
+        VoiceOption("es", "es", "Sharvard · media", "la de siempre, castellano",
+            "es_ES-sharvard-medium.onnx", hf + "vits-piper-es_ES-sharvard-medium/resolve/main", 77),
+        VoiceOption("es-mx-claude", "es", "Claude · alta (México)", "español mexicano, la más natural",
+            "es_MX-claude-high.onnx", hf + "vits-piper-es_MX-claude-high/resolve/main", 64),
+        VoiceOption("es-davefx", "es", "Davefx · media", "voz masculina, castellano",
+            "es_ES-davefx-medium.onnx", hf + "vits-piper-es_ES-davefx-medium/resolve/main", 64),
+    )
 
-    interface ModelSet {
-        val id: String
-        val label: String
-        val files: List<RemoteFile>
-        val bytes: Long get() = 0L
-    }
+    fun voicesFor(lang: String): List<VoiceOption> = voices.filter { it.lang == lang }
 
-    data class RemoteFile(val name: String, val url: String)
+    fun voice(id: String): VoiceOption? = voices.firstOrNull { it.id == id }
+
+    /** The default voice for a language: what an existing install already has on disk. */
+    fun defaultVoice(lang: String): VoiceOption = voicesFor(lang).first()
+
+    /** Silero VAD, ~2 MB: the thing that hears you stop talking. */
+    val vadFile = RemoteFile("silero_vad.onnx",
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx")
 
     // --- state -----------------------------------------------------------------------------
 
@@ -112,14 +141,18 @@ class VoiceRepository(private val context: Context) {
     fun whisperTokens(set: ModelSet): File =
         File(sttDir, set.files.first { it.name.endsWith(".txt") }.name)
 
-    fun ttsFiles(lang: String): List<RemoteFile> = if (lang == "es") VoiceEs.files else VoiceEn.files
+    fun voiceInstalled(option: VoiceOption): Boolean =
+        option.files.all { File(ttsDir(option.id), it.name).isFile }
 
-    fun ttsInstalled(lang: String): Boolean = ttsFiles(lang).all { File(ttsDir(lang), it.name).isFile }
+    fun voiceModelFile(option: VoiceOption): File = File(ttsDir(option.id), option.modelFile)
 
-    fun ttsModelFile(lang: String): File =
-        File(ttsDir(lang), ttsFiles(lang).first { it.name.endsWith(".onnx") }.name)
+    fun voiceTokensFile(option: VoiceOption): File = File(ttsDir(option.id), "tokens.txt")
 
-    fun ttsTokensFile(lang: String): File = File(ttsDir(lang), "tokens.txt")
+    fun anyVoiceInstalled(lang: String): Boolean = voicesFor(lang).any { voiceInstalled(it) }
+
+    fun vadInstalled(): Boolean = File(vadDir, vadFile.name).isFile
+
+    fun vadModel(): File = File(vadDir, vadFile.name)
 
     /** espeak-ng phoneme data for Piper, copied out of assets exactly once. */
     fun ensureEspeakData(assets: AssetManager): File {

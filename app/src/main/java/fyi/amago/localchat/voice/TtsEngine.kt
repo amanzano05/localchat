@@ -88,17 +88,21 @@ class TtsEngine(private val repo: VoiceRepository) {
      * Loads the voice for [lang]. Returns false (with [lastError] set) when the voice is not
      * installed or the engine refuses to come up.
      */
-    fun load(lang: String, espeakDir: String): Boolean = synchronized(engineLock) { loadLocked(lang, espeakDir) }
+    fun load(voiceId: String, espeakDir: String): Boolean = synchronized(engineLock) { loadLocked(voiceId, espeakDir) }
 
-    private fun loadLocked(lang: String, espeakDir: String): Boolean {
-        if (tts != null && loadedLang == lang) return true
+    private fun loadLocked(voiceId: String, espeakDir: String): Boolean {
+        if (tts != null && loadedLang == voiceId) return true
         releaseEngine()
-        if (!repo.ttsInstalled(lang)) {
-            lastError = "Voice for $lang is not downloaded"
+        val option = repo.voice(voiceId) ?: run {
+            lastError = "Unknown voice $voiceId"
             return false
         }
-        val model = repo.ttsModelFile(lang)
-        val tokens = repo.ttsTokensFile(lang)
+        if (!repo.voiceInstalled(option)) {
+            lastError = "La voz ${option.label} todavía no está descargada"
+            return false
+        }
+        val model = repo.voiceModelFile(option)
+        val tokens = repo.voiceTokensFile(option)
         if (!looksLikeOnnx(model) || !tokens.isFile) {
             lastError = "Voice file is damaged — download the voice again"
             log("REFUSING load: ${model.name}=${model.length()}B tokens=${tokens.length()}B")
@@ -111,7 +115,7 @@ class TtsEngine(private val repo: VoiceRepository) {
             return false
         }
         // Logged *before* the native call: if the process dies here, the last line names the step.
-        log("loading voice $lang: model=${model.length() / 1_048_576}MB dataDir=$espeakDir")
+        log("loading voice $voiceId: model=${model.length() / 1_048_576}MB dataDir=$espeakDir")
         return runCatching {
             val config = OfflineTtsConfig(
                 model = OfflineTtsModelConfig(
@@ -138,9 +142,9 @@ class TtsEngine(private val repo: VoiceRepository) {
                 return false
             }
             tts = engine
-            loadedLang = lang
+            loadedLang = voiceId
             lastError = null
-            log("LOADED voice $lang @ ${rate}Hz (${model.name}, ${model.length() / 1_048_576}MB)")
+            log("LOADED voice $voiceId @ ${rate}Hz (${model.name}, ${model.length() / 1_048_576}MB)")
             logMemory("after load")
             true
         }.getOrElse {
@@ -162,7 +166,7 @@ class TtsEngine(private val repo: VoiceRepository) {
      * only cross-language traffic is the return value. Responsiveness is kept by splitting the
      * answer into sentence-sized chunks and generating the next one while the current one plays.
      */
-    fun speak(text: String, lang: String, espeakDir: String, speed: Float = 1.0f) {
+    fun speak(text: String, voiceId: String, espeakDir: String, speed: Float = 1.0f) {
         val clean = text.trim()
         if (clean.isEmpty()) return
         synchronized(engineLock) {
@@ -170,12 +174,12 @@ class TtsEngine(private val repo: VoiceRepository) {
                 releaseEngine()
                 pendingClose = false
             }
-            speakLocked(clean, lang, espeakDir, speed)
+            speakLocked(clean, voiceId, espeakDir, speed)
         }
     }
 
-    private fun speakLocked(clean: String, lang: String, espeakDir: String, speed: Float) {
-        if (!load(lang, espeakDir)) return
+    private fun speakLocked(clean: String, voiceId: String, espeakDir: String, speed: Float) {
+        if (!load(voiceId, espeakDir)) return
         val engine = tts ?: return
 
         val sampleRate = runCatching { engine.sampleRate() }.getOrDefault(0)
