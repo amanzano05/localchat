@@ -6,6 +6,8 @@ import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.collectIsDraggedAsState
@@ -38,8 +40,11 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -95,6 +100,10 @@ fun ChatScreen(vm: ChatViewModel) {
     var showModels by remember { mutableStateOf(false) }
     var showChats by remember { mutableStateOf(false) }
     var showVoice by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
+    var showOverflow by remember { mutableStateOf(false) }
+    val promptDraft by vm.promptDraft.collectAsStateWithLifecycle()
+    val promptDirty by vm.promptDirty.collectAsStateWithLifecycle()
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) vm.importModel(context, uri)
@@ -155,9 +164,26 @@ fun ChatScreen(vm: ChatViewModel) {
                     }
                 },
                 actions = {
-                    TextButton(onClick = { showVoice = true }) { Text("Voice") }
-                    TextButton(onClick = { showChats = true }) { Text("Chats") }
-                    TextButton(onClick = { showModels = !showModels }) { Text("Model") }
+                    TextButton(onClick = { showSettings = true }) { Text("Ajustes") }
+                    Box {
+                        IconButton(onClick = { showOverflow = true }) {
+                            Icon(Icons.Default.MoreVert, contentDescription = "Más")
+                        }
+                        DropdownMenu(expanded = showOverflow, onDismissRequest = { showOverflow = false }) {
+                            DropdownMenuItem(
+                                text = { Text("Voice") },
+                                onClick = { showOverflow = false; showVoice = true },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Chats") },
+                                onClick = { showOverflow = false; showChats = true },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Model") },
+                                onClick = { showOverflow = false; showModels = !showModels },
+                            )
+                        }
+                    }
                 },
             )
         },
@@ -273,6 +299,23 @@ fun ChatScreen(vm: ChatViewModel) {
 
     // Opening the sheet re-reads disk + log, so a crash from the last session is visible here.
     LaunchedEffect(showVoice) { if (showVoice) vm.refreshVoice() }
+
+    if (showSettings) {
+        ModalBottomSheet(onDismissRequest = { showSettings = false }) {
+            SettingsSheet(
+                prompt = promptDraft,
+                defaultPrompt = vm.defaultPrompt,
+                examples = vm.promptExamples,
+                dirty = promptDirty,
+                onPromptChange = { vm.setPromptDraft(it) },
+                onApply = {
+                    vm.applyPrompt()
+                    showSettings = false
+                },
+                onReset = { vm.resetPrompt() },
+            )
+        }
+    }
 
     if (showVoice) {
         ModalBottomSheet(onDismissRequest = { showVoice = false }) {
@@ -838,5 +881,111 @@ private fun VoiceProblemCard(message: String, log: String, onDismiss: () -> Unit
                 }
             }
         }
+    }
+}
+
+
+/**
+ * Ajustes: the instructions the model gets before every conversation.
+ *
+ * The model reads them when a conversation is created, so saving rebuilds the current one with the
+ * thread replayed into it — the chat keeps its memory, the model changes its manners. Empty means
+ * "use the built-in instruction", which is why the box shows it as a placeholder instead of text.
+ */
+@Composable
+private fun SettingsSheet(
+    prompt: String,
+    defaultPrompt: String,
+    examples: List<String>,
+    dirty: Boolean,
+    onPromptChange: (String) -> Unit,
+    onApply: () -> Unit,
+    onReset: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
+        Text("Ajustes", style = MaterialTheme.typography.titleLarge)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Cómo quieres que se comporte el modelo. Persona, intención, tono, idioma\u2026 lo que le dirías a alguien antes de empezar a trabajar con él.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        Spacer(Modifier.height(16.dp))
+        Text("Instrucciones para el modelo", style = MaterialTheme.typography.labelMedium)
+        Spacer(Modifier.height(6.dp))
+        OutlinedTextField(
+            value = prompt,
+            onValueChange = onPromptChange,
+            modifier = Modifier.fillMaxWidth(),
+            placeholder = {
+                Text(
+                    defaultPrompt,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                )
+            },
+            minLines = 5,
+            maxLines = 12,
+            shape = RoundedCornerShape(14.dp),
+            supportingText = {
+                Text(
+                    when {
+                        prompt.isBlank() -> "Vacío: se usa la instrucción de fábrica (arriba, en gris)"
+                        dirty -> "${prompt.trim().length} caracteres \u00b7 sin guardar"
+                        else -> "${prompt.trim().length} caracteres \u00b7 aplicadas"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (dirty) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            },
+        )
+
+        Spacer(Modifier.height(10.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = onApply, enabled = dirty || prompt.isBlank()) {
+                Text(if (dirty) "Guardar y aplicar" else "Aplicar")
+            }
+            TextButton(onClick = onReset, enabled = prompt.isNotBlank()) { Text("Vaciar") }
+        }
+        Text(
+            "Aplicar reconstruye la conversación actual con tu hilo y las instrucciones nuevas: el chat no pierde la memoria, el modelo cambia de modales.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        Spacer(Modifier.height(18.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(12.dp))
+        Text("Ejemplos", style = MaterialTheme.typography.labelMedium)
+        Text(
+            "Toca uno para ponerlo en el campo y edítalo a tu gusto.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(6.dp))
+        examples.forEach { example ->
+            Surface(
+                onClick = { onPromptChange(example) },
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+            ) {
+                Text(
+                    example,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+        Text(
+            "La voz, el idioma y el manos libres se ajustan en Voice (men\u00fa \u22ee).",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(28.dp))
     }
 }

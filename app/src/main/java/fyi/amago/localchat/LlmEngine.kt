@@ -24,6 +24,12 @@ class LlmEngine {
     private var engine: Engine? = null
     private var conversation: Conversation? = null
 
+    /**
+     * What the model is told before every conversation. Set by the app from the user's own
+     * instructions; falls back to [SYSTEM_PROMPT] when they have not written any.
+     */
+    var systemPrompt: String = SYSTEM_PROMPT
+
     val isLoaded: Boolean get() = conversation != null
 
     /** Loads the model. Tries GPU first (falls back to CPU) and returns the backend actually used. */
@@ -100,7 +106,7 @@ class LlmEngine {
     private fun newConversationConfig(
         history: List<Pair<Boolean, String>> = emptyList(),
     ) = ConversationConfig(
-        systemInstruction = Contents.of(SYSTEM_PROMPT),
+        systemInstruction = Contents.of(systemPrompt.ifBlank { SYSTEM_PROMPT }),
         // Replay only the tail of the thread: enough for continuity, cheap on context.
         initialMessages = history.takeLast(HISTORY_REPLAY_LIMIT).map { (fromUser, text) ->
             if (fromUser) Message.user(text) else Message.model(text)

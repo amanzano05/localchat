@@ -57,6 +57,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private val repo = ModelRepository(app)
     private val store = ChatStore(app)
+    private val settings = Settings(app)
     private val engine = LlmEngine()
     private val voice = VoiceController(app)
 
@@ -70,6 +71,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val _state = MutableStateFlow(ChatUiState())
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
 
+    /** The instructions the user is editing, and whether they differ from what is saved. */
+    private val _promptDraft = MutableStateFlow(settings.systemPrompt())
+    val promptDraft: StateFlow<String> = _promptDraft.asStateFlow()
+
+    /** True when the box holds something different from what the model is using. */
+    private val _promptDirty = MutableStateFlow(false)
+    val promptDirty: StateFlow<Boolean> = _promptDirty.asStateFlow()
+
     private var handsFreeJob: Job? = null
     private val SETTLE_MS = 600L
     private val conversations = mutableListOf<ChatStore.StoredConversation>()
@@ -77,6 +86,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private var nextId = 0L
 
     init {
+        engine.systemPrompt = settings.systemPrompt().ifBlank { LlmEngine.SYSTEM_PROMPT }
         val (stored, current) = store.load()
         conversations.addAll(stored)
         if (conversations.isEmpty()) {
@@ -421,6 +431,39 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun clearVoiceError() = voice.clearVoiceError()
 
     fun clearNotice() = _state.update { it.copy(notice = null) }
+
+    // ---------------------------------------------------------------- settings
+
+    fun setPromptDraft(text: String) {
+        _promptDraft.value = text
+        _promptDirty.value = text.trim() != settings.systemPrompt()
+    }
+
+    /**
+     * Saves the instructions and puts them to work: the model only reads them when a conversation
+     * is created, so this rebuilds the current one and replays the thread into it. The chat keeps
+     * its context; the model just changes how it behaves.
+     */
+    fun applyPrompt() {
+        val text = _promptDraft.value.trim()
+        settings.setSystemPrompt(text)
+        engine.systemPrompt = text.ifBlank { LlmEngine.SYSTEM_PROMPT }
+        _promptDirty.value = false
+        val history = historyOfCurrent()
+        viewModelScope.launch(Dispatchers.IO) { engine.switchConversation(history) }
+        _state.update {
+            it.copy(notice = if (text.isBlank()) "Instrucciones restablecidas" else "Instrucciones aplicadas")
+        }
+    }
+
+    /** Puts the box back to the built-in instruction and applies it. */
+    fun resetPrompt() {
+        _promptDraft.value = ""
+        _promptDirty.value = settings.hasCustomPrompt()
+    }
+
+    val defaultPrompt: String get() = Settings.DEFAULT_PROMPT
+    val promptExamples: List<String> get() = Settings.EXAMPLES
 
     fun notice(message: String) = _state.update { it.copy(notice = message) }
 
