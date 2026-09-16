@@ -282,15 +282,34 @@ class VoiceController(private val context: Context) {
          */
         fun speakable(text: String): String {
             var t = text
+            // Typographic punctuation first: these are the characters a model emits and a
+            // phonemiser has never seen. Straight ASCII equivalents read the same aloud.
+            val normalise = mapOf(
+                "\u2018" to "'", "\u2019" to "'", "\u201A" to ",",
+                "\u201C" to "\"", "\u201D" to "\"", "\u201E" to "\"",
+                "\u2013" to "-", "\u2014" to "-", "\u2212" to "-",
+                "\u2026" to ".", "\u00A0" to " ", "\u202F" to " ",
+                "\u200B" to " ", "\u200C" to " ", "\u200D" to " ",
+                "\u2022" to ".", "\u00B7" to ".",
+                "\u2192" to " to ", "\u2265" to " at least ", "\u2264" to " at most ", "\u00D7" to " by ",
+            )
+            for ((from, to) in normalise) t = t.replace(from, to)
             t = t.replace(Regex("```[\\s\\S]*?```"), " ")
             t = t.replace(Regex("`([^`]*)`"), "$1")
             t = t.replace(Regex("!?\\[([^\\]]*)\\]\\([^)]*\\)"), "$1")
             t = t.replace(Regex("https?://\\S+"), " ")
-            t = t.replace(Regex("(?m)^\\s{0,3}#{1,6}\\s*"), "")
-            t = t.replace(Regex("(?m)^\\s*[-*+]\\s+"), "")
-            t = t.replace(Regex("(?m)^\\s*\\d+[.)]\\s+"), "")
+            // Markers become a beat instead of nothing, or a list reads as one long sentence.
+            t = t.replace(Regex("(?m)^\\s{0,3}#{1,6}\\s*"), ". ")
+            t = t.replace(Regex("(?m)^\\s*[-*+]\\s+"), ". ")
+            t = t.replace(Regex("(?m)^\\s*\\d+[.)]\\s+"), ". ")
             t = t.replace(Regex("\\*\\*|__|~~"), "")
-            t = t.replace(Regex("[\\u{1F300}-\\u{1FAFF}\\u{2600}-\\u{27BF}\\u{FE0F}\\u{200D}]"), "")
+            // Emoji and symbol planes, plus anything left that is not a letter, a digit or the
+            // punctuation a voice can actually pronounce. Spanish accents and ñ stay: they are letters.
+            t = t.replace(Regex("[\\u{1F000}-\\u{1FFFF}\\u{2190}-\\u{2BFF}\\u{FE00}-\\u{FE0F}\\u{2000}-\\u{206F}]"), " ")
+            t = t.replace(Regex("[^\\p{L}\\p{N} .,;:!?'\"()\\-/%]"), " ")
+            // A run of punctuation with no speech in it (---, ***, |...|) is noise.
+            t = t.replace(Regex("\\s*([.,;:!?%\\-])\\1+\\s*"), " ")
+            t = t.replace(Regex("\\s*[|^~`<>{}[\\]]+\\s*"), " ")
             t = t.replace(Regex("\\n{2,}"), ". ")
             t = t.replace('\n', ' ')
             t = t.replace(Regex("\\s{2,}"), " ")

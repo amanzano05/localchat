@@ -226,9 +226,12 @@ class TtsEngine(private val repo: VoiceRepository) {
             log("generating ${chunks.size} chunk(s), ${clean.length} chars")
             for ((index, chunk) in chunks.withIndex()) {
                 if (stopping.get()) break
+                // Logged before the call, with the text: if the engine dies here, this line names
+                // the exact string that killed it, and the same string can be replayed on a laptop.
+                log("  chunk ${index + 1}/${chunks.size} (${chunk.length} chars): ${chunk.take(80)}")
                 val audio = engine.generate(chunk, 0, speed)
                 if (stopping.get()) break
-                log("  chunk ${index + 1}/${chunks.size}: ${audio.samples.size} samples")
+                log("    -> ${audio.samples.size} samples")
                 queue.offer(audio.samples)
             }
         } catch (t: Throwable) {
