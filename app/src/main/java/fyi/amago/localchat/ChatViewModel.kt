@@ -289,7 +289,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 persist()
             }
             // Speak the answer once it is complete — never mid-stream, or it stutters.
-            if (voice.speakReplies.value && finalText.isNotBlank()) voice.speak(finalText)
+            // Wrapped on purpose: viewModelScope has no exception handler, so anything thrown here
+            // would take the whole app down. The voice is optional; dying for it is not.
+            if (voice.speakReplies.value && finalText.isNotBlank()) {
+                try {
+                    voice.speak(finalText)
+                } catch (t: Throwable) {
+                    voice.log("speak() threw: ${t.javaClass.simpleName}: ${t.message}")
+                }
+            }
         }
     }
 
@@ -351,6 +359,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Re-reads what is on disk and the tail of the voice log. */
     fun refreshVoice() = voice.refresh()
+
+    /** Hides the voice problem card. */
+    fun clearVoiceError() = voice.clearVoiceError()
 
     fun clearNotice() = _state.update { it.copy(notice = null) }
 

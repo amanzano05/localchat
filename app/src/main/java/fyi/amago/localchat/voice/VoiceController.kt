@@ -69,6 +69,17 @@ class VoiceController(private val context: Context) {
     val speakReplies: StateFlow<Boolean> = _speakReplies.asStateFlow()
 
     init {
+        // If the marker from a previous attempt is still set, that attempt never returned: the
+        // engine died mid-sentence. Say so on launch, in the chat, where it cannot be missed.
+        if (prefs.getBoolean(KEY_INFLIGHT, false)) {
+            prefs.edit().putBoolean(KEY_INFLIGHT, false).apply()
+            _models.update {
+                it.copy(
+                    voiceError = "La voz se quedó a medias la última vez y el motor se cayó",
+                    voiceLog = logTail(10),
+                )
+            }
+        }
         refresh()
     }
 
@@ -151,18 +162,31 @@ class VoiceController(private val context: Context) {
 
     /** Speaks [text] and suspends until the last word is out (or it is stopped). */
     suspend fun speak(text: String) {
+        log("speak() called with ${text.length} chars")
+        runCatching { speakInner(text) }.onFailure {
+            fail("Voice failed: ${it.javaClass.simpleName}: ${it.message}")
+        }
+    }
+
+    private suspend fun speakInner(text: String) {
+        // Logged before anything else in this method: if the app dies and the log ends here, the
+        // crash is in this call at all — not in the engine, not in the text processing below.
         val clean = speakable(text)
+        log("speakable() -> ${clean.length} chars: ${clean.take(60)}")
         if (clean.isBlank() || !_speakReplies.value) return
         val espeak = withContext(Dispatchers.IO) {
             runCatching { repo.ensureEspeakData(context.assets).absolutePath }.getOrDefault("")
         }
+        log("phoneme data ready: ${espeak.ifEmpty { "MISSING" }}")
         if (espeak.isEmpty()) {
             fail("Voice data missing")
             return
         }
         _state.value = VoiceState.Speaking(System.currentTimeMillis())
         log("asking the voice process to speak ${clean.length} chars")
+        prefs.edit().putBoolean(KEY_INFLIGHT, true).apply()
         val ok = ttsClient.speak(clean, _lang.value, espeak)
+        prefs.edit().putBoolean(KEY_INFLIGHT, false).apply()
         if (ok) {
             _state.value = VoiceState.Idle
             _models.update { it.copy(voiceError = null) }
@@ -192,6 +216,10 @@ class VoiceController(private val context: Context) {
         val report = ttsClient.testVoice(_lang.value)
         _models.update { it.copy(lastCheck = report, voiceError = ttsClient.lastError, voiceLog = logTail(8)) }
         return report
+    }
+
+    fun clearVoiceError() {
+        _models.update { it.copy(voiceError = null) }
     }
 
     fun logTail(lines: Int = 10): String = runCatching {
@@ -274,6 +302,7 @@ class VoiceController(private val context: Context) {
         private const val TAG = "VoiceController"
         private const val KEY_LANG = "lang"
         private const val KEY_SPEAK = "speak_replies"
+        private const val KEY_INFLIGHT = "speech_inflight"
         private const val MIN_SECONDS = 0.25f
 
         /**

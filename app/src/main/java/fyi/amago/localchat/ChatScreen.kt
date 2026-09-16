@@ -36,6 +36,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -208,6 +209,14 @@ fun ChatScreen(vm: ChatViewModel) {
                         }
                     }
                 }
+            }
+
+            voiceModels.voiceError?.let { problem ->
+                VoiceProblemCard(
+                    message = problem,
+                    log = voiceModels.voiceLog,
+                    onDismiss = { vm.clearVoiceError() },
+                )
             }
 
             VoiceStrip(
@@ -710,3 +719,51 @@ private fun voiceLabel(models: VoiceModelsState, lang: String): String {
 
 private fun hasMic(context: Context): Boolean =
     ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+
+/**
+ * The visible half of the voice diagnostics. When the speech engine dies mid-sentence the app
+ * restarts clean — and this card is waiting with the message and the tail of the log, so the
+ * evidence does not depend on remembering where a sheet hid it.
+ */
+@Composable
+private fun VoiceProblemCard(message: String, log: String, onDismiss: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Voz",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = onDismiss) { Text("Ocultar") }
+            }
+            Text(
+                message,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+            if (log.isNotBlank()) {
+                Text(
+                    "Log de voz (las \u00faltimas l\u00edneas)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                )
+                SelectionContainer {
+                    Text(
+                        log,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                    )
+                }
+            }
+        }
+    }
+}
