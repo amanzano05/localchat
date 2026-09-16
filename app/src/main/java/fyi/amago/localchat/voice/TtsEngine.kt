@@ -45,6 +45,19 @@ class TtsEngine(private val repo: VoiceRepository) {
 
     val logFile: File get() = File(repo.root, "voice.log")
 
+    /**
+     * Records how much memory the process is holding before a synthesis run. Native heap is the
+     * number that matters — the models live there, and the Java heap limit says nothing about it.
+     */
+    fun logMemory(where: String) {
+        val runtime = Runtime.getRuntime()
+        val javaUsed = (runtime.totalMemory() - runtime.freeMemory()) / 1_048_576
+        val javaMax = runtime.maxMemory() / 1_048_576
+        val nativeUsed = android.os.Debug.getNativeHeapAllocatedSize() / 1_048_576
+        val nativeSize = android.os.Debug.getNativeHeapSize() / 1_048_576
+        log("memory at $where: java ${javaUsed}MB/${javaMax}MB, native ${nativeUsed}MB/${nativeSize}MB")
+    }
+
     /** Appends one line to the on-device voice log, so a field problem can be read back later. */
     fun log(line: String) {
         val stamp = java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US)
@@ -113,6 +126,7 @@ class TtsEngine(private val repo: VoiceRepository) {
             loadedLang = lang
             lastError = null
             log("LOADED voice $lang @ ${rate}Hz (${model.name}, ${model.length() / 1_048_576}MB)")
+            logMemory("after load")
             true
         }.getOrElse {
             lastError = "Voice engine error: ${it.message ?: it.javaClass.simpleName}"
@@ -183,6 +197,7 @@ class TtsEngine(private val repo: VoiceRepository) {
         // playing while the rest is still being synthesised.
         val chunks = sentenceChunks(clean)
         try {
+            logMemory("speak")
             log("generating ${chunks.size} chunk(s), ${clean.length} chars")
             for ((index, chunk) in chunks.withIndex()) {
                 if (stopping.get()) break

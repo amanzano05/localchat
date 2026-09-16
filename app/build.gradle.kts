@@ -14,8 +14,8 @@ android {
         applicationId = "fyi.amago.localchat"
         minSdk = 28
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.5.2"
+        versionCode = 8
+        versionName = "0.5.3"
         ndk {
             // The litertlm-android AAR ships arm64-v8a + x86_64 only.
             abiFilters += listOf("arm64-v8a")

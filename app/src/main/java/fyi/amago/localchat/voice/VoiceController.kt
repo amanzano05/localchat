@@ -159,11 +159,13 @@ class VoiceController(private val context: Context) {
             fail("Voice data missing")
             return
         }
-        // Whisper and Piper never need to be resident at the same time, and Gemma is already
-        // holding a gigabyte or two: hand the memory back before asking for more.
-        stt.close()
+        // Deliberately no stt.close() here. Releasing the Whisper recogniser immediately before
+        // creating the Piper engine tears down ONNX Runtime's shared environment inside the same
+        // native library, and the next session is built on freed memory: instant segfault. The
+        // memory saving is ~100 MB; the cost was the whole app. Learnt from the device log.
         _state.value = VoiceState.Speaking(System.currentTimeMillis())
-        tts.log("speak ${clean.length} chars")
+        tts.log("speak ${clean.length} chars, stt loaded=${stt.isLoaded}")
+        tts.logMemory("speak requested")
         withContext(Dispatchers.IO) {
             if (tts.load(_lang.value, espeak)) tts.speak(clean, _lang.value, espeak)
         }
