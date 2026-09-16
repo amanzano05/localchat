@@ -7,6 +7,15 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
+// Kokoro ships one model for every language it speaks: the model and the voices are shared, and the
+// language is chosen by speaker id inside voices.bin. The Spanish id is not documented for this
+// build — it was found by synthesising with all 103 voices and transcribing each one with Whisper,
+// which is the only honest way to know which one actually speaks Spanish.
+private const val KOKORO_BASE = "https://huggingface.co/csukuangfj/kokoro-int8-multi-lang-v1_1/resolve/main"
+private const val KOKORO_LEXICON = "lexicon-us-en.txt"
+private const val KOKORO_EN_SPEAKER = 1      // af_bella, verified by ear on the phone
+private const val KOKORO_ES_SPEAKER = 28     // ef_dora, from the official sid table (29 = em_alex, male)
+
 /**
  * What has to be on the phone for voice, where it comes from, and how it gets there.
  *
@@ -54,12 +63,26 @@ class VoiceRepository(private val context: Context) {
         val modelFile: String,
         val urlBase: String,
         val megabytes: Int,
+        /** "vits" (Piper) or "kokoro": which loader the speech process builds. */
+        val kind: String = "vits",
+        /** Kokoro picks a voice by number inside voices.bin; Piper ignores it. */
+        val speakerId: Int = 0,
+        /** Folder under tts/. Two options can share one, so a shared model downloads once. */
+        val dir: String = id,
     ) {
         val files: List<RemoteFile>
-            get() = listOf(
-                RemoteFile(modelFile, "$urlBase/$modelFile"),
-                RemoteFile("tokens.txt", "$urlBase/tokens.txt"),
-            )
+            get() = when (kind) {
+                "kokoro" -> listOf(
+                    RemoteFile(modelFile, "$urlBase/$modelFile"),
+                    RemoteFile("voices.bin", "$urlBase/voices.bin"),
+                    RemoteFile("tokens.txt", "$urlBase/tokens.txt"),
+                    RemoteFile(KOKORO_LEXICON, "$urlBase/$KOKORO_LEXICON"),
+                )
+                else -> listOf(
+                    RemoteFile(modelFile, "$urlBase/$modelFile"),
+                    RemoteFile("tokens.txt", "$urlBase/tokens.txt"),
+                )
+            }
     }
 
     /** Multilingual Whisper tiny, int8: ~99 MB and good enough to know what you said. */
@@ -109,11 +132,18 @@ class VoiceRepository(private val context: Context) {
             "es_MX-claude-high.onnx", hf + "vits-piper-es_MX-claude-high/resolve/main", 64),
         VoiceOption("es-davefx", "es", "Davefx · media", "voz masculina, castellano",
             "es_ES-davefx-medium.onnx", hf + "vits-piper-es_ES-davefx-medium/resolve/main", 64),
+        VoiceOption("kokoro-en", "en", "Kokoro · natural", "la más humana; tarda un poco más",
+            "model.int8.onnx", KOKORO_BASE, 166, kind = "kokoro", speakerId = KOKORO_EN_SPEAKER, dir = "kokoro"),
+        VoiceOption("kokoro-es", "es", "Kokoro · natural (latino)", "la más humana en español",
+            "model.int8.onnx", KOKORO_BASE, 166, kind = "kokoro", speakerId = KOKORO_ES_SPEAKER, dir = "kokoro"),
     )
 
     fun voicesFor(lang: String): List<VoiceOption> = voices.filter { it.lang == lang }
 
-    fun voice(id: String): VoiceOption? = voices.firstOrNull { it.id == id }
+    /** Chooses the entry for a language when two options share an id's model but not its voice. */
+    fun voice(id: String, lang: String? = null): VoiceOption? =
+        voices.firstOrNull { it.id == id && (lang == null || it.lang == lang) }
+            ?: voices.firstOrNull { it.id == id }
 
     /** The default voice for a language: what an existing install already has on disk. */
     fun defaultVoice(lang: String): VoiceOption = voicesFor(lang).first()
@@ -142,11 +172,15 @@ class VoiceRepository(private val context: Context) {
         File(sttDir, set.files.first { it.name.endsWith(".txt") }.name)
 
     fun voiceInstalled(option: VoiceOption): Boolean =
-        option.files.all { File(ttsDir(option.id), it.name).isFile }
+        option.files.all { File(ttsDir(option.dir), it.name).isFile }
 
-    fun voiceModelFile(option: VoiceOption): File = File(ttsDir(option.id), option.modelFile)
+    fun voiceModelFile(option: VoiceOption): File = File(ttsDir(option.dir), option.modelFile)
 
-    fun voiceTokensFile(option: VoiceOption): File = File(ttsDir(option.id), "tokens.txt")
+    fun voiceTokensFile(option: VoiceOption): File = File(ttsDir(option.dir), "tokens.txt")
+
+    fun voiceVoicesFile(option: VoiceOption): File = File(ttsDir(option.dir), "voices.bin")
+
+    fun voiceLexiconFile(option: VoiceOption): File = File(ttsDir(option.dir), KOKORO_LEXICON)
 
     fun anyVoiceInstalled(lang: String): Boolean = voicesFor(lang).any { voiceInstalled(it) }
 

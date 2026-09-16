@@ -6,6 +6,7 @@ import android.media.AudioTrack
 import android.util.Log
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
+import com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
 import java.io.File
@@ -103,9 +104,14 @@ class TtsEngine(private val repo: VoiceRepository) {
         }
         val model = repo.voiceModelFile(option)
         val tokens = repo.voiceTokensFile(option)
+        val isKokoro = option.kind == "kokoro"
         if (!looksLikeOnnx(model) || !tokens.isFile) {
             lastError = "Voice file is damaged — download the voice again"
             log("REFUSING load: ${model.name}=${model.length()}B tokens=${tokens.length()}B")
+            return false
+        }
+        if (isKokoro && !repo.voiceVoicesFile(option).isFile) {
+            lastError = "Falta el archivo de voces de Kokoro — descarga la voz de nuevo"
             return false
         }
         val espeak = File(espeakDir)
@@ -117,13 +123,23 @@ class TtsEngine(private val repo: VoiceRepository) {
         // Logged *before* the native call: if the process dies here, the last line names the step.
         log("loading voice $voiceId: model=${model.length() / 1_048_576}MB dataDir=$espeakDir")
         return runCatching {
+            // One loader or the other, never both: sherpa builds every engine it is handed, and two
+            // empty configs are what "not this one" looks like in the Kotlin API.
             val config = OfflineTtsConfig(
                 model = OfflineTtsModelConfig(
-                    vits = OfflineTtsVitsModelConfig(
+                    vits = if (isKokoro) OfflineTtsVitsModelConfig() else OfflineTtsVitsModelConfig(
                         model = model.absolutePath,
                         tokens = tokens.absolutePath,
                         dataDir = espeak.absolutePath,
                     ),
+                    kokoro = if (isKokoro) OfflineTtsKokoroModelConfig(
+                        model = model.absolutePath,
+                        voices = repo.voiceVoicesFile(option).absolutePath,
+                        tokens = tokens.absolutePath,
+                        dataDir = espeak.absolutePath,
+                        lexicon = repo.voiceLexiconFile(option).absolutePath,
+                        lang = option.lang,
+                    ) else OfflineTtsKokoroModelConfig(),
                     numThreads = THREADS,
                     provider = "cpu",
                     debug = false,
@@ -135,6 +151,7 @@ class TtsEngine(private val repo: VoiceRepository) {
             // Prove the engine answers before trusting it: a null native handle returns 0 here
             // instead of segfaulting later, mid-sentence.
             val rate = engine.sampleRate()
+            log("engine kind=${option.kind} speaker=${option.speakerId}")
             if (rate <= 0) {
                 lastError = "Voice engine did not start"
                 log("LOAD FAILED: sampleRate=$rate")
@@ -181,6 +198,7 @@ class TtsEngine(private val repo: VoiceRepository) {
     private fun speakLocked(clean: String, voiceId: String, espeakDir: String, speed: Float) {
         if (!load(voiceId, espeakDir)) return
         val engine = tts ?: return
+        val option = repo.voice(voiceId) ?: return
 
         val sampleRate = runCatching { engine.sampleRate() }.getOrDefault(0)
         if (sampleRate <= 0) {
@@ -233,7 +251,7 @@ class TtsEngine(private val repo: VoiceRepository) {
                 // Logged before the call, with the text: if the engine dies here, this line names
                 // the exact string that killed it, and the same string can be replayed on a laptop.
                 log("  chunk ${index + 1}/${chunks.size} (${chunk.length} chars): ${chunk.take(80)}")
-                val audio = engine.generate(chunk, 0, speed)
+                val audio = engine.generate(chunk, option.speakerId, speed)
                 if (stopping.get()) break
                 log("    -> ${audio.samples.size} samples")
                 queue.offer(audio.samples)
