@@ -344,6 +344,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun sttDescription(): String = voice.sttDescription()
 
+    /** The sheet's self-check: files, engine, and a spoken test sentence, reported in words. */
+    fun runVoiceCheck() {
+        viewModelScope.launch { voice.runVoiceCheck() }
+    }
+
+    /** Re-reads what is on disk and the tail of the voice log. */
+    fun refreshVoice() = voice.refresh()
+
     fun clearNotice() = _state.update { it.copy(notice = null) }
 
     fun notice(message: String) = _state.update { it.copy(notice = message) }

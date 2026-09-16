@@ -2,23 +2,32 @@ package fyi.amago.localchat.voice
 
 import android.media.AudioAttributes
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioTrack
 import android.util.Log
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
+import java.io.File
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
 
 /**
  * Text to speech, on the phone, offline: Piper (VITS) voices through sherpa-onnx, one voice per
  * language, espeak-ng for phonemes.
  *
- * Speech starts as soon as the first chunk is synthesised (`generateWithCallback` → `AudioTrack`
- * in streaming mode), so a long answer does not wait for its last word to be audible. Barge-in is
- * one call: [stop] flushes the track and tells the synthesiser to stop.
+ * Two rules shape this class, both learned the hard way:
+ *
+ * 1. **Never do audio work inside the synthesiser's callback.** That callback is entered from native
+ *    code; anything that throws there unwinds through JNI and takes the process down with no Java
+ *    exception to catch. The callback only copies samples into a queue — a writer thread owns the
+ *    `AudioTrack`.
+ * 2. **Never touch the engine or the track without knowing they are valid.** Loading is verified
+ *    (`sampleRate()` inside a guard) before a single call is made into it, and every failure is
+ *    written to [logFile] and reported through [lastError] instead of being swallowed.
  */
 class TtsEngine(private val repo: VoiceRepository) {
 
@@ -26,22 +35,62 @@ class TtsEngine(private val repo: VoiceRepository) {
     private var loadedLang: String? = null
     private var track: AudioTrack? = null
     private val speaking = AtomicBoolean(false)
+    private val stopping = AtomicBoolean(false)
+
+    @Volatile var lastError: String? = null
+        private set
 
     val isReady: Boolean get() = tts != null
     val isSpeaking: Boolean get() = speaking.get()
 
-    /** Loads the voice for [lang] ("en" / "es"). Returns false when that voice is not installed. */
+    val logFile: File get() = File(repo.root, "voice.log")
+
+    /** Appends one line to the on-device voice log, so a field problem can be read back later. */
+    fun log(line: String) {
+        val stamp = java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US)
+            .format(java.util.Date())
+        runCatching { logFile.appendText("$stamp  $line\n") }
+        Log.i(TAG, line)
+    }
+
+    /** Keeps the log short enough to show in a sheet: last 120 lines. */
+    fun logTail(lines: Int = 12): String = runCatching {
+        logFile.readLines().takeLast(lines).joinToString("\n")
+    }.getOrDefault("")
+
+    /**
+     * Loads the voice for [lang]. Returns false (with [lastError] set) when the voice is not
+     * installed or the engine refuses to come up.
+     */
     fun load(lang: String, espeakDir: String): Boolean {
         if (tts != null && loadedLang == lang) return true
         close()
-        if (!repo.ttsInstalled(lang)) return false
+        if (!repo.ttsInstalled(lang)) {
+            lastError = "Voice for $lang is not downloaded"
+            return false
+        }
+        val model = repo.ttsModelFile(lang)
+        val tokens = repo.ttsTokensFile(lang)
+        if (!looksLikeOnnx(model) || !tokens.isFile) {
+            lastError = "Voice file is damaged — download the voice again"
+            log("REFUSING load: ${model.name}=${model.length()}B tokens=${tokens.length()}B")
+            return false
+        }
+        val espeak = File(espeakDir)
+        if (!espeak.isDirectory) {
+            lastError = "Phoneme data is missing"
+            log("REFUSING load: espeak dir absent: $espeakDir")
+            return false
+        }
+        // Logged *before* the native call: if the process dies here, the last line names the step.
+        log("loading voice $lang: model=${model.length() / 1_048_576}MB dataDir=$espeakDir")
         return runCatching {
             val config = OfflineTtsConfig(
                 model = OfflineTtsModelConfig(
                     vits = OfflineTtsVitsModelConfig(
-                        model = repo.ttsModelFile(lang).absolutePath,
-                        tokens = repo.ttsTokensFile(lang).absolutePath,
-                        dataDir = espeakDir,
+                        model = model.absolutePath,
+                        tokens = tokens.absolutePath,
+                        dataDir = espeak.absolutePath,
                     ),
                     numThreads = THREADS,
                     provider = "cpu",
@@ -50,33 +99,119 @@ class TtsEngine(private val repo: VoiceRepository) {
                 maxNumSentences = 1,
                 silenceScale = 0.2f,
             )
-            tts = OfflineTts(config = config)
+            val engine = OfflineTts(config = config)
+            // Prove the engine answers before trusting it: a null native handle returns 0 here
+            // instead of segfaulting later, mid-sentence.
+            val rate = engine.sampleRate()
+            if (rate <= 0) {
+                lastError = "Voice engine did not start"
+                log("LOAD FAILED: sampleRate=$rate")
+                runCatching { engine.release() }
+                return false
+            }
+            tts = engine
             loadedLang = lang
-            Log.i(TAG, "Piper voice loaded: $lang @ ${tts?.sampleRate()} Hz")
+            lastError = null
+            log("LOADED voice $lang @ ${rate}Hz (${model.name}, ${model.length() / 1_048_576}MB)")
             true
         }.getOrElse {
-            Log.e(TAG, "TTS failed to load for $lang", it)
+            lastError = "Voice engine error: ${it.message ?: it.javaClass.simpleName}"
+            log("LOAD THREW: ${it.javaClass.simpleName}: ${it.message}")
             tts = null
             false
         }
     }
 
     /**
-     * Speaks [text] from start to finish, streaming. Blocking on purpose: the controller calls it
-     * from a coroutine on Dispatchers.IO, and returning is what marks the end of the turn.
+     * Speaks [text] from start to finish. Blocking on purpose: the caller runs it on
+     * Dispatchers.IO and returning is what marks the end of the turn.
      */
     fun speak(text: String, lang: String, espeakDir: String, speed: Float = 1.0f) {
-        val engine = tts ?: if (load(lang, espeakDir)) tts!! else return
         val clean = text.trim()
         if (clean.isEmpty()) return
+        if (!load(lang, espeakDir)) return
+        val engine = tts ?: return
 
-        val sampleRate = engine.sampleRate()
+        val sampleRate = runCatching { engine.sampleRate() }.getOrDefault(0)
+        if (sampleRate <= 0) {
+            lastError = "Voice engine is not answering"
+            log("speak: sampleRate=$sampleRate, aborting")
+            return
+        }
+
+        val queue = ArrayBlockingQueue<FloatArray>(64)
+        val finished = AtomicBoolean(false)
+        val writerError = AtomicReference<String?>(null)
+        val out = openTrack(sampleRate) ?: return
+
+        speaking.set(true)
+        stopping.set(false)
+
+        // The writer owns the track for the whole utterance; nothing else touches it until join().
+        val writer = Thread({
+            var written = 0L
+            try {
+                out.play()
+                while (true) {
+                    val chunk = queue.poll(250, TimeUnit.MILLISECONDS) ?: if (finished.get()) break else continue
+                    val pcm = ShortArray(chunk.size)
+                    for (i in chunk.indices) {
+                        pcm[i] = (chunk[i].coerceIn(-1f, 1f) * 32767f).toInt().toShort()
+                    }
+                    val n = out.write(pcm, 0, pcm.size)
+                    if (n < 0) {
+                        writerError.set("AudioTrack.write returned $n")
+                        break
+                    }
+                    written += n
+                }
+            } catch (t: Throwable) {
+                // Caught *here*, off the native callback, so it can never unwind through JNI.
+                writerError.set("${t.javaClass.simpleName}: ${t.message}")
+            }
+            log("speak: wrote $written samples (${written / sampleRate.toFloat()}s of audio)")
+        }, "tts-writer").apply { isDaemon = true; start() }
+
+        try {
+            log("generating ${clean.length} chars")
+            engine.generateWithCallback(text = clean, sid = 0, speed = speed) { samples ->
+                // Inside JNI: no I/O, no throwing, no heavy work. Copy and hand off, nothing else.
+                try {
+                    if (stopping.get()) return@generateWithCallback 0
+                    val copy = FloatArray(samples.size)
+                    System.arraycopy(samples, 0, copy, 0, samples.size)
+                    queue.offer(copy)
+                    if (stopping.get()) 0 else 1
+                } catch (t: Throwable) {
+                    log("callback swallowed ${t.javaClass.simpleName}")
+                    0
+                }
+            }
+        } catch (t: Throwable) {
+            lastError = "Speech failed: ${t.message ?: t.javaClass.simpleName}"
+            log("GENERATE THREW: ${t.javaClass.simpleName}: ${t.message}")
+        } finally {
+            stopping.set(true)
+            speaking.set(false)
+            finished.set(true)
+            // Drain the queue so the writer can finish, then let it exit before the track dies.
+            queue.offer(FloatArray(0))
+            runCatching { writer.join(2_000) }
+            closeTrack(out)
+            writerError.get()?.let {
+                lastError = "Audio output failed: $it"
+                log("WRITER ERROR: $it")
+            }
+        }
+    }
+
+    private fun openTrack(sampleRate: Int): AudioTrack? = runCatching {
         val minBuf = AudioTrack.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_OUT_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
         )
-        val out = AudioTrack.Builder()
+        val track = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_ASSISTANT)
@@ -90,52 +225,51 @@ class TtsEngine(private val repo: VoiceRepository) {
                     .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                     .build()
             )
-            .setBufferSizeInBytes(max(minBuf, sampleRate * 2 / 5)) // ~200 ms of slack
+            .setBufferSizeInBytes(max(if (minBuf > 0) minBuf else 4_096, sampleRate / 5 * 2))
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
-
-        track = out
-        speaking.set(true)
-        out.play()
-        try {
-            engine.generateWithCallback(text = clean, sid = 0, speed = speed) { samples ->
-                // Returning 0 asks the synthesiser to stop early — that is the barge-in path.
-                if (!speaking.get()) return@generateWithCallback 0
-                val pcm = ShortArray(samples.size)
-                for (i in samples.indices) {
-                    pcm[i] = (samples[i].coerceIn(-1f, 1f) * 32767f).toInt().toShort()
-                }
-                out.write(pcm, 0, pcm.size)
-                1
-            }
-        } catch (t: Throwable) {
-            Log.e(TAG, "Speech synthesis failed", t)
-        } finally {
-            speaking.set(false)
-            runCatching {
-                out.stop()
-                out.release()
-            }
-            if (track === out) track = null
-        }
+        track
+    }.getOrElse {
+        lastError = "Could not open the speaker: ${it.message}"
+        log("AUDIOTRACK FAILED: ${it.javaClass.simpleName}: ${it.message}")
+        null
     }
 
-    /** Barge-in: stop mid-word. Safe to call from anywhere. */
+    private fun closeTrack(out: AudioTrack) {
+        runCatching { if (out.playState != AudioTrack.PLAYSTATE_STOPPED) out.stop() }
+        runCatching { out.flush() }
+        runCatching { out.release() }
+        if (track === out) track = null
+    }
+
+    /** Barge-in: stop mid-word. Safe from any thread; the writer notices and unwinds. */
     fun stop() {
+        stopping.set(true)
         speaking.set(false)
-        runCatching { track?.pause(); track?.flush() }
     }
 
     fun close() {
         stop()
+        runCatching { track?.pause() }
         runCatching { tts?.release() }
         tts = null
         loadedLang = null
     }
 
+    /** ONNX models are protobuf; an HTML error page from the CDN is what a bad download looks like. */
+    private fun looksLikeOnnx(f: File): Boolean {
+        if (!f.isFile || f.length() < 1_000_000) return false
+        return runCatching {
+            f.inputStream().use { input ->
+                val head = ByteArray(8)
+                val n = input.read(head)
+                n > 0 && head[0] != '<'.code.toByte() && head[0] != 0x0A.toByte()
+            }
+        }.getOrDefault(false)
+    }
+
     companion object {
         private const val TAG = "TtsEngine"
         private const val THREADS = 2
-        const val AUDIO_MANAGER_STREAM = AudioManager.STREAM_MUSIC
     }
 }

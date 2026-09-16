@@ -260,6 +260,9 @@ fun ChatScreen(vm: ChatViewModel) {
         }
     }
 
+    // Opening the sheet re-reads disk + log, so a crash from the last session is visible here.
+    LaunchedEffect(showVoice) { if (showVoice) vm.refreshVoice() }
+
     if (showVoice) {
         ModalBottomSheet(onDismissRequest = { showVoice = false }) {
             VoiceSheet(
@@ -270,6 +273,7 @@ fun ChatScreen(vm: ChatViewModel) {
                 onLang = { vm.setVoiceLang(it) },
                 onSpeak = { vm.setSpeakReplies(it) },
                 onDownload = { vm.downloadVoiceModels() },
+                onTest = { vm.runVoiceCheck() },
             )
         }
     }
@@ -603,6 +607,7 @@ private fun VoiceSheet(
     onLang: (String) -> Unit,
     onSpeak: (Boolean) -> Unit,
     onDownload: () -> Unit,
+    onTest: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
         Text("Voice", style = MaterialTheme.typography.titleLarge)
@@ -639,6 +644,34 @@ private fun VoiceSheet(
         StatusLine("Speech to text", sttName)
         StatusLine("Voice", voiceLabel(models, lang))
         StatusLine("Storage", "about 160 MB once everything is in")
+
+        Spacer(Modifier.height(12.dp))
+        OutlinedButton(
+            onClick = onTest,
+            enabled = !models.downloading && models.ready,
+        ) { Text("Test voice") }
+
+        models.voiceError?.let {
+            Text(
+                "Last error: $it",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        models.lastCheck?.let {
+            Spacer(Modifier.height(8.dp))
+            Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+
+        if (models.voiceLog.isNotBlank()) {
+            Spacer(Modifier.height(10.dp))
+            Text("Voice log", style = MaterialTheme.typography.labelMedium)
+            Text(
+                models.voiceLog,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
 
         Spacer(Modifier.height(12.dp))
         if (models.downloading) {

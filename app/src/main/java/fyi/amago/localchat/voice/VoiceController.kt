@@ -27,6 +27,12 @@ data class VoiceModelsState(
     val downloading: Boolean = false,
     val progress: Float = 0f,
     val label: String = "",
+    /** Result of the last "Test voice" run, shown verbatim in the sheet. */
+    val lastCheck: String? = null,
+    /** Last failure from the speech engines, if any. */
+    val voiceError: String? = null,
+    /** Tail of the on-device voice log: survives a crash, which is the point of it. */
+    val voiceLog: String = "",
 ) {
     /** Voice is usable once speech recognition and at least one voice are present. */
     val ready: Boolean get() = sttInstalled && (ttsEnInstalled || ttsEsInstalled)
@@ -71,6 +77,8 @@ class VoiceController(private val context: Context) {
                 sttInstalled = repo.sttInstalled(),
                 ttsEnInstalled = repo.ttsInstalled("en"),
                 ttsEsInstalled = repo.ttsInstalled("es"),
+                voiceLog = tts.logTail(8),
+                voiceError = tts.lastError,
             )
         }
     }
@@ -148,15 +156,73 @@ class VoiceController(private val context: Context) {
             runCatching { repo.ensureEspeakData(context.assets).absolutePath }.getOrDefault("")
         }
         if (espeak.isEmpty()) {
-            _state.value = VoiceState.Failed("Voice data missing")
+            fail("Voice data missing")
             return
         }
+        // Whisper and Piper never need to be resident at the same time, and Gemma is already
+        // holding a gigabyte or two: hand the memory back before asking for more.
+        stt.close()
         _state.value = VoiceState.Speaking(System.currentTimeMillis())
+        tts.log("speak ${clean.length} chars")
         withContext(Dispatchers.IO) {
             if (tts.load(_lang.value, espeak)) tts.speak(clean, _lang.value, espeak)
         }
-        _state.value = VoiceState.Idle
+        tts.lastError?.let { fail(it) } ?: run { _state.value = VoiceState.Idle }
+        _models.update { it.copy(voiceError = tts.lastError) }
     }
+
+    private fun fail(message: String) {
+        _state.value = VoiceState.Failed(message)
+        _models.update { it.copy(voiceError = message) }
+        tts.log("FAILED $message")
+    }
+
+    /**
+     * The self-check the sheet offers: are the files there, does the engine come up, does it
+     * actually make sound. Reports in plain sentences so a problem can be described without a cable.
+     */
+    suspend fun runVoiceCheck(): String {
+        val report = StringBuilder()
+        val sttSet = repo.installedStt()
+        report.append("speech to text: ").append(sttSet?.label ?: "missing").append('\n')
+
+        val espeak = withContext(Dispatchers.IO) {
+            runCatching { repo.ensureEspeakData(context.assets) }.getOrNull()
+        }
+        val lang = _lang.value
+        if (espeak == null) {
+            report.append("phoneme data: MISSING (could not be unpacked)\n")
+        } else {
+            val count = espeak.walkTopDown().count { it.isFile }
+            val core = listOf("phontab", "phondata", "phonindex", "intonations").all { File(espeak, it).isFile }
+            report.append("phoneme data: ").append(count).append(" files, core complete=").append(core).append('\n')
+        }
+
+        val installed = repo.ttsInstalled(lang)
+        val voiceSize = if (installed) "${repo.ttsModelFile(lang).length() / 1_048_576} MB" else "missing"
+        report.append("voice (").append(lang).append("): ").append(voiceSize).append('\n')
+
+        if (espeak != null && installed) {
+            val loaded = withContext(Dispatchers.IO) { tts.load(lang, espeak.absolutePath) }
+            report.append("engine: ").append(if (loaded) "loaded" else "FAILED \u2014 " + (tts.lastError ?: "unknown")).append('\n')
+            if (loaded) {
+                val started = System.currentTimeMillis()
+                withContext(Dispatchers.IO) { tts.speak("Voice test, one two three.", lang, espeak.absolutePath) }
+                val ms = System.currentTimeMillis() - started
+                val err = tts.lastError
+                report.append("synthesis: ").append(if (err == null) "ok in ${ms} ms" else "FAILED \u2014 $err").append('\n')
+            }
+        } else if (!installed) {
+            report.append("Download the voice, then run the test again.\n")
+        }
+
+        report.append("log:\n").append(tts.logTail(8))
+        val text = report.toString()
+        _models.update { it.copy(lastCheck = text, voiceError = tts.lastError) }
+        return text
+    }
+
+    fun logTail(lines: Int = 10): String = tts.logTail(lines)
 
     fun stopSpeaking() {
         tts.stop()
