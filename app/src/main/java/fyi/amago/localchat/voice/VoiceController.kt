@@ -172,7 +172,7 @@ class VoiceController(private val context: Context) {
         // Logged before anything else in this method: if the app dies and the log ends here, the
         // crash is in this call at all — not in the engine, not in the text processing below.
         val clean = speakable(text)
-        log("speakable() -> ${clean.length} chars: ${clean.take(60)}")
+        log("speakable() -> ${clean.length} chars: ${clean.take(80)}")
         if (clean.isBlank() || !_speakReplies.value) return
         val espeak = withContext(Dispatchers.IO) {
             runCatching { repo.ensureEspeakData(context.assets).absolutePath }.getOrDefault("")
@@ -309,7 +309,10 @@ class VoiceController(private val context: Context) {
          * Turns model output into something worth hearing: no markdown noise, no code blocks, no
          * URLs read out one character at a time.
          */
-        fun speakable(text: String): String {
+        fun speakable(text: String): String =
+            runCatching { speakableUnsafe(text) }.getOrElse { text.take(600) }
+
+        private fun speakableUnsafe(text: String): String {
             var t = text
             // Typographic punctuation first: these are the characters a model emits and a
             // phonemiser has never seen. Straight ASCII equivalents read the same aloud.
@@ -332,13 +335,24 @@ class VoiceController(private val context: Context) {
             t = t.replace(Regex("(?m)^\\s*[-*+]\\s+"), ". ")
             t = t.replace(Regex("(?m)^\\s*\\d+[.)]\\s+"), ". ")
             t = t.replace(Regex("\\*\\*|__|~~"), "")
-            // Emoji and symbol planes, plus anything left that is not a letter, a digit or the
-            // punctuation a voice can actually pronounce. Spanish accents and ñ stay: they are letters.
-            t = t.replace(Regex("[\\u{1F000}-\\u{1FFFF}\\u{2190}-\\u{2BFF}\\u{FE00}-\\u{FE0F}\\u{2000}-\\u{206F}]"), " ")
+            // Emoji, arrows, maths and symbol planes, plus variation selectors: characters no voice
+            // can pronounce. Done in plain code on purpose — `\\u{1F000}` is *not* a valid escape in
+            // Java's regex engine, and that single wrong pattern used to take the whole app down
+            // (PatternSyntaxException inside the answer coroutine, with no exception handler above it).
+            t = buildString(t.length) {
+                for (ch in t) {
+                    val c = ch.code
+                    val drop = c >= 0x1F000 ||
+                        c in 0x2190..0x2BFF ||
+                        c in 0xFE00..0xFE0F ||
+                        c in 0x2000..0x206F
+                    if (!drop) append(ch)
+                }
+            }
             t = t.replace(Regex("[^\\p{L}\\p{N} .,;:!?'\"()\\-/%]"), " ")
             // A run of punctuation with no speech in it (---, ***, |...|) is noise.
             t = t.replace(Regex("\\s*([.,;:!?%\\-])\\1+\\s*"), " ")
-            t = t.replace(Regex("\\s*[|^~`<>{}[\\]]+\\s*"), " ")
+            t = t.replace(Regex("\\s*[|^~`<>\\[\\]{}()]+\\s*"), " ")
             t = t.replace(Regex("\\n{2,}"), ". ")
             t = t.replace('\n', ' ')
             t = t.replace(Regex("\\s{2,}"), " ")
