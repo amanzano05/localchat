@@ -43,7 +43,7 @@ Whisper weights, Piper voices, MIT/Apache licences.
 | `voice/VoiceRepository.kt` | Model catalog, download (resumable per file, sequential), install checks, and the espeak-ng data copy out of assets. |
 | `voice/VoiceRecorder.kt` | `AudioRecord` capture, `VOICE_RECOGNITION` source, RMS level, 60 s ceiling, float32 output. |
 | `voice/SttEngine.kt` | Whisper through sherpa-onnx. Lazy load, stays warm, one utterance in → one line out. |
-| `voice/TtsEngine.kt` | Piper through sherpa-onnx. Streams synthesis straight into an `AudioTrack`; `stop()` is the barge-in. |
+| `voice/TtsEngine.kt` | Piper through sherpa-onnx via `generate()` (never the callback variant). Sentence chunks, a writer thread that owns the `AudioTrack`, `stop()` as the barge-in, everything logged. |
 | `voice/VoiceController.kt` | The conductor: state machine, language, downloads, speak-replies preference, markdown→speech cleanup. |
 | `ChatViewModel.kt` | Owns the controller, sends the transcript as a message, speaks finished answers. |
 | `ChatScreen.kt` | Mic button, level meter, status strip, `Voice` sheet (language, speak replies, downloads). |
@@ -87,6 +87,36 @@ complete is skipped on the next attempt.
 Speech is deliberately **not** started mid-stream: sentence-by-sentence playback sounds like a
 stutter when the model pauses to think, and it makes barge-in ambiguous. The answer completes, then
 it is spoken.
+
+## The one that cost a phone crash: never use `generateWithCallback`
+
+First shipped version used `OfflineTts.generateWithCallback()` and streamed the chunks straight into
+an `AudioTrack`. On the S25 the app **died on every attempt**, and the on-device log pinned it:
+
+```
+15:47:18  loading voice en: model=60MB dataDir=…/voice/espeak-ng-data
+15:47:19  LOADED voice en @ 16000Hz (en_US-amy-low.onnx, 60MB)
+15:47:19  generating 26 chars          <- last line; process gone
+```
+
+The engine was healthy — espeak, the model and the data directory were all fine (the same files
+synthesise correctly on the server). What died was the *callback*: that variant makes the native
+synthesiser call back up into the JVM for every chunk, and on this device that up-call takes the
+process down, with no Java exception to catch and no stack trace.
+
+The fix is structural, not defensive: **`generate()` — the variant that returns the audio instead of
+pushing it** — so synthesis stays entirely inside native code and the only cross-language traffic is
+a return value. Responsiveness is preserved by splitting the answer into sentence-sized chunks and
+generating the next one on the IO thread while the previous one is still playing. Same latency
+behaviour, no up-calls.
+
+Two supporting rules came out of the same night:
+
+- **Audio work never happens inside a native callback.** The writer thread owns the `AudioTrack`, and
+  it is `join`ed before the track is released, so no write can ever land on a dead track.
+- **Every step is logged before it is taken** (to `files/voice/voice.log`, shown in the Voice sheet).
+  A crash that names its own location is worth more than any amount of theorising: this log line is
+  what turned "the app dies" into a one-line fix.
 
 ## Behaviour rules that are not styling
 

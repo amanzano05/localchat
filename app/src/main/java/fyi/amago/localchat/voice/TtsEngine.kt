@@ -125,6 +125,13 @@ class TtsEngine(private val repo: VoiceRepository) {
     /**
      * Speaks [text] from start to finish. Blocking on purpose: the caller runs it on
      * Dispatchers.IO and returning is what marks the end of the turn.
+     *
+     * **`generate()`, never `generateWithCallback()`.** The callback variant makes the native
+     * synthesiser call back up into the JVM once per chunk, and on this phone that call is what
+     * killed the process (the log always ended at "generating", one line past a healthy load). The
+     * plain call returns the audio instead, so synthesis stays entirely inside native code and the
+     * only cross-language traffic is the return value. Responsiveness is kept by splitting the
+     * answer into sentence-sized chunks and generating the next one while the current one plays.
      */
     fun speak(text: String, lang: String, espeakDir: String, speed: Float = 1.0f) {
         val clean = text.trim()
@@ -154,6 +161,7 @@ class TtsEngine(private val repo: VoiceRepository) {
                 out.play()
                 while (true) {
                     val chunk = queue.poll(250, TimeUnit.MILLISECONDS) ?: if (finished.get()) break else continue
+                    if (chunk.isEmpty()) continue
                     val pcm = ShortArray(chunk.size)
                     for (i in chunk.indices) {
                         pcm[i] = (chunk[i].coerceIn(-1f, 1f) * 32767f).toInt().toShort()
@@ -166,26 +174,22 @@ class TtsEngine(private val repo: VoiceRepository) {
                     written += n
                 }
             } catch (t: Throwable) {
-                // Caught *here*, off the native callback, so it can never unwind through JNI.
                 writerError.set("${t.javaClass.simpleName}: ${t.message}")
             }
             log("speak: wrote $written samples (${written / sampleRate.toFloat()}s of audio)")
         }, "tts-writer").apply { isDaemon = true; start() }
 
+        // Produce here, on the caller's IO thread: sentence by sentence, so the first words start
+        // playing while the rest is still being synthesised.
+        val chunks = sentenceChunks(clean)
         try {
-            log("generating ${clean.length} chars")
-            engine.generateWithCallback(text = clean, sid = 0, speed = speed) { samples ->
-                // Inside JNI: no I/O, no throwing, no heavy work. Copy and hand off, nothing else.
-                try {
-                    if (stopping.get()) return@generateWithCallback 0
-                    val copy = FloatArray(samples.size)
-                    System.arraycopy(samples, 0, copy, 0, samples.size)
-                    queue.offer(copy)
-                    if (stopping.get()) 0 else 1
-                } catch (t: Throwable) {
-                    log("callback swallowed ${t.javaClass.simpleName}")
-                    0
-                }
+            log("generating ${chunks.size} chunk(s), ${clean.length} chars")
+            for ((index, chunk) in chunks.withIndex()) {
+                if (stopping.get()) break
+                val audio = engine.generate(chunk, 0, speed)
+                if (stopping.get()) break
+                log("  chunk ${index + 1}/${chunks.size}: ${audio.samples.size} samples")
+                queue.offer(audio.samples)
             }
         } catch (t: Throwable) {
             lastError = "Speech failed: ${t.message ?: t.javaClass.simpleName}"
@@ -194,15 +198,49 @@ class TtsEngine(private val repo: VoiceRepository) {
             stopping.set(true)
             speaking.set(false)
             finished.set(true)
-            // Drain the queue so the writer can finish, then let it exit before the track dies.
             queue.offer(FloatArray(0))
-            runCatching { writer.join(2_000) }
+            runCatching { writer.join(3_000) }
             closeTrack(out)
             writerError.get()?.let {
                 lastError = "Audio output failed: $it"
                 log("WRITER ERROR: $it")
             }
         }
+    }
+
+    /**
+     * Splits an answer into chunks small enough to start speaking quickly, without ever cutting a
+     * word in half. Long sentences are broken at commas first, then at spaces.
+     */
+    private fun sentenceChunks(text: String, limit: Int = 180): List<String> {
+        val sentences = ArrayList<String>()
+        val current = StringBuilder()
+        for (ch in text) {
+            current.append(ch)
+            if (ch == '.' || ch == '!' || ch == '?' || ch == ';' || ch == ':' || ch == '\u2026') {
+                if (current.toString().trim().isNotEmpty()) sentences.add(current.toString().trim())
+                current.setLength(0)
+            }
+        }
+        if (current.toString().trim().isNotEmpty()) sentences.add(current.toString().trim())
+
+        // merge tiny fragments ("Ok." + "Sure.") so it does not speak in staccato
+        val merged = ArrayList<String>()
+        for (s in sentences) {
+            val last = merged.lastOrNull()
+            if (last != null && (last.length + s.length + 1) <= limit) {
+                merged[merged.lastIndex] = "$last $s"
+            } else {
+                merged.add(s)
+            }
+        }
+        return merged.flatMap { piece ->
+            if (piece.length <= limit) listOf(piece)
+            else piece.split(", ").flatMap { part ->
+                if (part.length <= limit) listOf(part)
+                else part.chunked(limit).map { it.trim() }.filter { it.isNotEmpty() }
+            }
+        }.filter { it.isNotBlank() }
     }
 
     private fun openTrack(sampleRate: Int): AudioTrack? = runCatching {
