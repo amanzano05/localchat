@@ -69,6 +69,8 @@ class VoiceRepository(private val context: Context) {
         val speakerId: Int = 0,
         /** Folder under tts/. Two options can share one, so a shared model downloads once. */
         val dir: String = id,
+        /** What a fresh install hears, and what the sheet preselects. */
+        val isDefault: Boolean = false,
     ) {
         val files: List<RemoteFile>
             get() = when (kind) {
@@ -128,12 +130,13 @@ class VoiceRepository(private val context: Context) {
             "en_US-lessac-high.onnx", hf + "vits-piper-en_US-lessac-high/resolve/main", 110),
         VoiceOption("es", "es", "Sharvard · media", "la de siempre, castellano",
             "es_ES-sharvard-medium.onnx", hf + "vits-piper-es_ES-sharvard-medium/resolve/main", 77),
-        VoiceOption("es-mx-claude", "es", "Claude · alta (México)", "español mexicano, la más natural",
-            "es_MX-claude-high.onnx", hf + "vits-piper-es_MX-claude-high/resolve/main", 64),
+        VoiceOption("es-mx-claude", "es", "Claude · alta (México)", "español mexicano · el elegido",
+            "es_MX-claude-high.onnx", hf + "vits-piper-es_MX-claude-high/resolve/main", 64, isDefault = true),
         VoiceOption("es-davefx", "es", "Davefx · media", "voz masculina, castellano",
             "es_ES-davefx-medium.onnx", hf + "vits-piper-es_ES-davefx-medium/resolve/main", 64),
-        VoiceOption("kokoro-en", "en", "Kokoro · natural", "la más humana; tarda un poco más",
-            "model.int8.onnx", KOKORO_BASE, 166, kind = "kokoro", speakerId = KOKORO_EN_SPEAKER, dir = "kokoro"),
+        VoiceOption("kokoro-en", "en", "Kokoro · natural", "la más humana · el elegido en inglés",
+            "model.int8.onnx", KOKORO_BASE, 166, kind = "kokoro", speakerId = KOKORO_EN_SPEAKER,
+            dir = "kokoro", isDefault = true),
         VoiceOption("kokoro-es", "es", "Kokoro · natural (latino)", "la más humana en español",
             "model.int8.onnx", KOKORO_BASE, 166, kind = "kokoro", speakerId = KOKORO_ES_SPEAKER, dir = "kokoro"),
     )
@@ -145,8 +148,9 @@ class VoiceRepository(private val context: Context) {
         voices.firstOrNull { it.id == id && (lang == null || it.lang == lang) }
             ?: voices.firstOrNull { it.id == id }
 
-    /** The default voice for a language: what an existing install already has on disk. */
-    fun defaultVoice(lang: String): VoiceOption = voicesFor(lang).first()
+    /** The voice a language starts on: the chosen default, or whatever is first in the list. */
+    fun defaultVoice(lang: String): VoiceOption =
+        voicesFor(lang).firstOrNull { it.isDefault } ?: voicesFor(lang).first()
 
     /** Silero VAD, ~2 MB: the thing that hears you stop talking. */
     val vadFile = RemoteFile("silero_vad.onnx",
